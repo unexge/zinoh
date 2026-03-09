@@ -42,7 +42,6 @@ pub const Push = struct {
     key_scope: u64 = 0,
     /// Key expression string suffix (sets N flag when non-null).
     key_suffix: ?[]const u8 = null,
-    // sender_mapping: bool = false,  // M flag — not yet needed
 
     /// Encode the Push header and key expression to the writer.
     /// The caller must encode the inner Zenoh message (Put/Del) immediately after.

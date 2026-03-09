@@ -38,10 +38,10 @@ pub const Encoding = struct {
     /// Encode this Encoding to the writer.
     pub fn encode(self: *const Encoding, writer: *Io.Writer) Io.Writer.Error!void {
         const has_schema = if (self.schema) |s| s.len > 0 else false;
-        const encoded_id: u64 = (@as(u64, self.id) << 1) | if (has_schema) @as(u64, 1) else @as(u64, 0);
+        const encoded_id: u64 = (@as(u64, self.id) << 1) | @as(u64, @intFromBool(has_schema));
         try vle.encode(encoded_id, writer);
         if (has_schema) {
-            try primitives.writeSlice(self.schema.?, writer);
+            try primitives.writeString(self.schema.?, writer);
         }
     }
 };
