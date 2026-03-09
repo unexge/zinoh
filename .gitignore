@@ -1,2 +1,5 @@
 .zig-cache/
 zig-out/
+test_timer*
+check_instant
+check_timer

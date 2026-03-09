@@ -66,13 +66,13 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration-test", "Run integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
-    // Benchmark harness
+    // Benchmark harness — always built with ReleaseFast for stable timings.
     const bench_exe = b.addExecutable(.{
         .name = "zinoh-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "zinoh", .module = mod },
             },
@@ -84,4 +84,7 @@ pub fn build(b: *std.Build) void {
     const bench_cmd = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&bench_cmd.step);
     bench_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
+    }
 }
