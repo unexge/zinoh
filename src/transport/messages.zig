@@ -1,7 +1,8 @@
 //! Transport messages: Init, Open, KeepAlive, Close, Frame.
 //!
-//! Implements encode/decode for the 4-message session handshake:
-//! InitSyn, InitAck, OpenSyn, OpenAck (Zenoh protocol v0x09 §4).
+//! Implements encode/decode for the session handshake (InitSyn, InitAck,
+//! OpenSyn, OpenAck) and session-lifetime messages (KeepAlive, Close)
+//! per Zenoh protocol v0x09.
 
 const std = @import("std");
 const Io = std.Io;
@@ -500,6 +501,80 @@ pub const OpenAck = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// KeepAlive
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// KeepAlive message: sent periodically (every lease/3) to prevent lease expiration.
+/// MID = 0x04, no flags, no body — just the 1-byte header.
+pub const KeepAlive = struct {
+    /// Encode this KeepAlive to the writer (1 byte: header only).
+    pub fn encode(_: *const KeepAlive, writer: *Io.Writer) EncodeError!void {
+        try writer.writeByte(@as(u8, MID.keep_alive));
+    }
+
+    /// Decode a KeepAlive from the reader. The header byte has already been parsed
+    /// to determine this is a KeepAlive (MID=0x04).
+    /// If the Z flag is set, any extensions are skipped for forward compatibility.
+    pub fn decode(header: u8, reader: *Io.Reader) DecodeError!KeepAlive {
+        const z_flag = (header & Flag.z_flag) != 0;
+        if (z_flag) {
+            try skipExtensions(reader);
+        }
+        return KeepAlive{};
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Close
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Reason code for Close message.
+pub const CloseReason = enum(u8) {
+    generic = 0x00,
+    unsupported = 0x01,
+    invalid = 0x02,
+    _,
+};
+
+/// Close message: sent to terminate a session or link.
+/// MID = 0x03, S flag (bit 5) = 1 for session close (vs link-only close).
+/// Body: 1-byte reason code.
+pub const Close = struct {
+    /// If true, this closes the entire session; if false, only the link.
+    session: bool = true,
+    reason: CloseReason = .generic,
+
+    /// Encode this Close to the writer.
+    pub fn encode(self: *const Close, writer: *Io.Writer) EncodeError!void {
+        // Header: |Z=0|x|S| MID=0x03 |
+        var header: u8 = @as(u8, MID.close);
+        if (self.session) header |= Flag.bit5; // S flag
+        try writer.writeByte(header);
+
+        // Reason code
+        try writer.writeByte(@intFromEnum(self.reason));
+    }
+
+    /// Decode a Close from the reader. The header byte has already been parsed
+    /// to determine this is a Close (MID=0x03).
+    pub fn decode(header: u8, reader: *Io.Reader) DecodeError!Close {
+        const s_flag = (header & Flag.bit5) != 0;
+        const z_flag = (header & Flag.z_flag) != 0;
+
+        const reason_byte = try reader.takeByte();
+
+        if (z_flag) {
+            try skipExtensions(reader);
+        }
+
+        return Close{
+            .session = s_flag,
+            .reason = @enumFromInt(reason_byte),
+        };
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Header parsing helper
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -543,6 +618,18 @@ fn encodeOpenSynHelper(msg: *const OpenSyn, buf: []u8) []const u8 {
 }
 
 fn encodeOpenAckHelper(msg: *const OpenAck, buf: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buf);
+    msg.encode(&writer) catch unreachable;
+    return writer.buffered();
+}
+
+fn encodeKeepAliveHelper(msg: *const KeepAlive, buf: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buf);
+    msg.encode(&writer) catch unreachable;
+    return writer.buffered();
+}
+
+fn encodeCloseHelper(msg: *const Close, buf: []u8) []const u8 {
     var writer: Io.Writer = .fixed(buf);
     msg.encode(&writer) catch unreachable;
     return writer.buffered();
@@ -1279,6 +1366,195 @@ test "full handshake sequence: encode all 4 messages" {
         const h = try reader.takeByte();
         _ = try OpenAck.decode(h, &reader);
     }
+}
+
+// ---------------------------------------------------------------------------
+// KeepAlive tests
+// ---------------------------------------------------------------------------
+
+test "KeepAlive: wire bytes = [0x04]" {
+    const msg = KeepAlive{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeKeepAliveHelper(&msg, &buf);
+    try assertEqualBytes(&.{0x04}, encoded);
+}
+
+test "KeepAlive: encoded length is 1 byte" {
+    const msg = KeepAlive{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeKeepAliveHelper(&msg, &buf);
+    try testing.expectEqual(@as(usize, 1), encoded.len);
+}
+
+test "KeepAlive: MID is keep_alive" {
+    const msg = KeepAlive{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeKeepAliveHelper(&msg, &buf);
+    try testing.expectEqual(@as(u5, MID.keep_alive), getMid(encoded[0]));
+}
+
+test "KeepAlive: round-trip" {
+    const original = KeepAlive{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeKeepAliveHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.keep_alive), getMid(header));
+    _ = try KeepAlive.decode(header, &reader);
+}
+
+test "KeepAlive: no flags set in header" {
+    const msg = KeepAlive{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeKeepAliveHelper(&msg, &buf);
+    // Header should be exactly MID with no flags
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expectEqual(@as(u3, 0), h.flags);
+    try testing.expectEqual(@as(u5, MID.keep_alive), h.mid);
+}
+
+// ---------------------------------------------------------------------------
+// Close tests
+// ---------------------------------------------------------------------------
+
+test "Close: encode session close with generic reason" {
+    const msg = Close{ .session = true, .reason = .generic };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    // Header: MID=0x03 | S=0x20 → 0x23
+    // Reason: 0x00
+    try assertEqualBytes(&.{ 0x23, 0x00 }, encoded);
+}
+
+test "Close: encode session close with unsupported reason" {
+    const msg = Close{ .session = true, .reason = .unsupported };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    try assertEqualBytes(&.{ 0x23, 0x01 }, encoded);
+}
+
+test "Close: encode session close with invalid reason" {
+    const msg = Close{ .session = true, .reason = .invalid };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    try assertEqualBytes(&.{ 0x23, 0x02 }, encoded);
+}
+
+test "Close: encode link-only close (S=0)" {
+    const msg = Close{ .session = false, .reason = .generic };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    // Header: MID=0x03, S=0 → 0x03
+    // Reason: 0x00
+    try assertEqualBytes(&.{ 0x03, 0x00 }, encoded);
+}
+
+test "Close: MID is close" {
+    const msg = Close{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    try testing.expectEqual(@as(u5, MID.close), getMid(encoded[0]));
+}
+
+test "Close: S-flag set for session close" {
+    const msg = Close{ .session = true };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(h.flag0()); // S flag is bit 5
+}
+
+test "Close: S-flag clear for link close" {
+    const msg = Close{ .session = false };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(!h.flag0());
+}
+
+test "Close: round-trip session close generic" {
+    const original = Close{ .session = true, .reason = .generic };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.close), getMid(header));
+    const decoded = try Close.decode(header, &reader);
+
+    try testing.expectEqual(original.session, decoded.session);
+    try testing.expectEqual(original.reason, decoded.reason);
+}
+
+test "Close: round-trip session close unsupported" {
+    const original = Close{ .session = true, .reason = .unsupported };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Close.decode(header, &reader);
+
+    try testing.expectEqual(true, decoded.session);
+    try testing.expectEqual(CloseReason.unsupported, decoded.reason);
+}
+
+test "Close: round-trip session close invalid" {
+    const original = Close{ .session = true, .reason = .invalid };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Close.decode(header, &reader);
+
+    try testing.expectEqual(true, decoded.session);
+    try testing.expectEqual(CloseReason.invalid, decoded.reason);
+}
+
+test "Close: round-trip link-only close" {
+    const original = Close{ .session = false, .reason = .generic };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Close.decode(header, &reader);
+
+    try testing.expectEqual(false, decoded.session);
+    try testing.expectEqual(CloseReason.generic, decoded.reason);
+}
+
+test "Close: round-trip unknown reason code (forward compat)" {
+    // CloseReason is non-exhaustive, so unknown codes survive round-trip
+    const original = Close{ .session = true, .reason = @enumFromInt(0xFF) };
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Close.decode(header, &reader);
+
+    try testing.expectEqual(true, decoded.session);
+    try testing.expectEqual(@as(u8, 0xFF), @intFromEnum(decoded.reason));
+}
+
+test "Close: encoded length is 2 bytes" {
+    const msg = Close{};
+    var buf: [8]u8 = undefined;
+    const encoded = encodeCloseHelper(&msg, &buf);
+    try testing.expectEqual(@as(usize, 2), encoded.len);
+}
+
+// ---------------------------------------------------------------------------
+// CloseReason tests
+// ---------------------------------------------------------------------------
+
+test "CloseReason: enum values match spec" {
+    try testing.expectEqual(@as(u8, 0x00), @intFromEnum(CloseReason.generic));
+    try testing.expectEqual(@as(u8, 0x01), @intFromEnum(CloseReason.unsupported));
+    try testing.expectEqual(@as(u8, 0x02), @intFromEnum(CloseReason.invalid));
 }
 
 test {
