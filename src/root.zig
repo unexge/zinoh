@@ -6,6 +6,7 @@ const std = @import("std");
 pub const codec = struct {
     pub const vle = @import("codec/vle.zig");
     pub const primitives = @import("codec/primitives.zig");
+    pub const header = @import("codec/header.zig");
 };
 
 pub const transport = struct {

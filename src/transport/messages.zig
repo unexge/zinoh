@@ -8,6 +8,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const vle = @import("../codec/vle.zig");
 const primitives = @import("../codec/primitives.zig");
+const hdr = @import("../codec/header.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -17,14 +18,8 @@ const primitives = @import("../codec/primitives.zig");
 pub const protocol_version: u8 = 0x09;
 
 /// Message IDs (bits 0-4 of header byte).
-pub const MID = struct {
-    pub const init: u5 = 0x01;
-    pub const open: u5 = 0x02;
-    pub const close: u5 = 0x03;
-    pub const keep_alive: u5 = 0x04;
-    pub const frame: u5 = 0x05;
-    pub const fragment: u5 = 0x06;
-};
+/// Re-exported from codec/header.zig — the single source of truth.
+pub const MID = hdr.TransportMid;
 
 /// Header flag masks.
 pub const Flag = struct {
@@ -509,13 +504,13 @@ pub const OpenAck = struct {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Extract the MID from a header byte (bits 0-4).
-pub fn getMid(header: u8) u5 {
-    return @truncate(header & 0x1F);
+pub fn getMid(byte: u8) u5 {
+    return hdr.Header.decode(byte).mid;
 }
 
 /// Check if the A flag (bit 5) is set.
-pub fn isAck(header: u8) bool {
-    return (header & Flag.bit5) != 0;
+pub fn isAck(byte: u8) bool {
+    return hdr.Header.decode(byte).isAck();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
