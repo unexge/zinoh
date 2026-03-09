@@ -1,18 +1,28 @@
-//! By convention, root.zig is the root source file when making a package.
+//! zinoh — A Zenoh client written in Zig.
+//!
+//! Public API re-exports for all submodules.
 const std = @import("std");
-const Io = std.Io;
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+pub const codec = struct {
+    pub const vle = @import("codec/vle.zig");
+    pub const primitives = @import("codec/primitives.zig");
+};
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+pub const transport = struct {
+    pub const messages = @import("transport/messages.zig");
+    pub const framing = @import("transport/framing.zig");
+};
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+pub const network = struct {
+    pub const messages = @import("network/messages.zig");
+};
+
+pub const zenoh = struct {
+    pub const messages = @import("zenoh/messages.zig");
+};
+
+pub const session = @import("session.zig");
+
+test {
+    std.testing.refAllDecls(@This());
 }
