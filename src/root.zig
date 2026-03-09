@@ -23,6 +23,8 @@ pub const zenoh = struct {
 
 pub const session = @import("session.zig");
 
+pub const testing = @import("testing.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
