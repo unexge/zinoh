@@ -193,6 +193,48 @@ const benchmarks = [_]Benchmark{
         .func = benchStringDecode128,
         .bytes_per_op = 130,
     },
+    // Frame encode benchmarks
+    .{
+        .name = "frame encode empty",
+        .func = benchFrameEncodeEmpty,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "frame encode 16 bytes",
+        .func = benchFrameEncode16,
+        .bytes_per_op = 2 + 16,
+    },
+    .{
+        .name = "frame encode 256 bytes",
+        .func = benchFrameEncode256,
+        .bytes_per_op = 2 + 256,
+    },
+    .{
+        .name = "frame encode 65535 bytes (max)",
+        .func = benchFrameEncodeMax,
+        .bytes_per_op = 2 + framing.max_frame_size,
+    },
+    // Frame decode benchmarks
+    .{
+        .name = "frame decode empty",
+        .func = benchFrameDecodeEmpty,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "frame decode 16 bytes",
+        .func = benchFrameDecode16,
+        .bytes_per_op = 2 + 16,
+    },
+    .{
+        .name = "frame decode 256 bytes",
+        .func = benchFrameDecode256,
+        .bytes_per_op = 2 + 256,
+    },
+    .{
+        .name = "frame decode 65535 bytes (max)",
+        .func = benchFrameDecodeMax,
+        .bytes_per_op = 2 + framing.max_frame_size,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -419,6 +461,96 @@ fn benchStringDecodeHello() void {
 fn benchStringDecode128() void {
     var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
     stringDecodeBench(encoded_string_128, fba.allocator());
+}
+
+// --- Frame encode benchmarks ---
+
+const framing = zinoh.transport.framing;
+
+fn frameEncodeBench(comptime payload_size: usize) void {
+    const payload = &([_]u8{0xAB} ** payload_size);
+    var buf: [2 + payload_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    framing.writeFrame(payload, &writer) catch unreachable;
+    std.mem.doNotOptimizeAway(writer.buffered());
+}
+
+fn benchFrameEncodeEmpty() void {
+    frameEncodeBench(0);
+}
+
+fn benchFrameEncode16() void {
+    frameEncodeBench(16);
+}
+
+fn benchFrameEncode256() void {
+    frameEncodeBench(256);
+}
+
+// max_frame_size encode uses a statically-allocated buffer.
+var frame_encode_max_payload: [framing.max_frame_size]u8 = [_]u8{0xCD} ** framing.max_frame_size;
+var frame_encode_max_buf: [2 + framing.max_frame_size]u8 = undefined;
+
+fn benchFrameEncodeMax() void {
+    var writer: std.Io.Writer = .fixed(&frame_encode_max_buf);
+    framing.writeFrame(&frame_encode_max_payload, &writer) catch unreachable;
+    std.mem.doNotOptimizeAway(writer.buffered());
+}
+
+// --- Frame decode benchmarks ---
+
+// Build framed wire data at comptime for small/medium sizes.
+fn buildFrameComptime(comptime payload_size: usize) *const [2 + payload_size]u8 {
+    comptime {
+        var result: [2 + payload_size]u8 = undefined;
+        // 2-byte LE length prefix
+        result[0] = @truncate(payload_size);
+        result[1] = @truncate(payload_size >> 8);
+        // Payload
+        for (result[2..]) |*b| b.* = 0xAB;
+        const final = result;
+        return &final;
+    }
+}
+
+const framed_empty = buildFrameComptime(0);
+const framed_16 = buildFrameComptime(16);
+const framed_256 = buildFrameComptime(256);
+
+fn frameDecodeBench(comptime framed: []const u8) void {
+    var reader: std.Io.Reader = .fixed(framed);
+    var read_buf: [framing.max_frame_size]u8 = undefined;
+    const result = framing.readFrame(&reader, &read_buf) catch unreachable;
+    std.mem.doNotOptimizeAway(result.ptr);
+}
+
+fn benchFrameDecodeEmpty() void {
+    frameDecodeBench(framed_empty);
+}
+
+fn benchFrameDecode16() void {
+    frameDecodeBench(framed_16);
+}
+
+fn benchFrameDecode256() void {
+    frameDecodeBench(framed_256);
+}
+
+// Max-size decode: build framed data at comptime.
+var framed_max_data: [2 + framing.max_frame_size]u8 = init_framed_max: {
+    @setEvalBranchQuota(200_000);
+    var data: [2 + framing.max_frame_size]u8 = undefined;
+    data[0] = 0xFF;
+    data[1] = 0xFF;
+    for (data[2..]) |*b| b.* = 0xCD;
+    break :init_framed_max data;
+};
+var frame_decode_max_buf: [framing.max_frame_size]u8 = undefined;
+
+fn benchFrameDecodeMax() void {
+    var reader: std.Io.Reader = .fixed(&framed_max_data);
+    const result = framing.readFrame(&reader, &frame_decode_max_buf) catch unreachable;
+    std.mem.doNotOptimizeAway(result.ptr);
 }
 
 // ---------------------------------------------------------------------------
