@@ -38,6 +38,7 @@ const Benchmark = struct {
 // ---------------------------------------------------------------------------
 
 const vle = zinoh.codec.vle;
+const primitives = zinoh.codec.primitives;
 
 const benchmarks = [_]Benchmark{
     .{
@@ -105,6 +106,92 @@ const benchmarks = [_]Benchmark{
         .name = "vle decode max u64",
         .func = benchVleDecodeMaxU64,
         .bytes_per_op = 9,
+    },
+    // uint16 LE encode benchmarks
+    .{
+        .name = "uint16 LE encode 0",
+        .func = benchUint16LEEncode0,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "uint16 LE encode 0xFFFF",
+        .func = benchUint16LEEncodeMax,
+        .bytes_per_op = 2,
+    },
+    // uint16 LE decode benchmarks
+    .{
+        .name = "uint16 LE decode 0",
+        .func = benchUint16LEDecode0,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "uint16 LE decode 0xFFFF",
+        .func = benchUint16LEDecodeMax,
+        .bytes_per_op = 2,
+    },
+    // Slice encode benchmarks
+    .{
+        .name = "slice encode empty",
+        .func = benchSliceEncodeEmpty,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "slice encode 16 bytes",
+        .func = benchSliceEncode16,
+        .bytes_per_op = 17,
+    },
+    .{
+        .name = "slice encode 256 bytes",
+        .func = benchSliceEncode256,
+        .bytes_per_op = 258,
+    },
+    // Slice decode benchmarks
+    .{
+        .name = "slice decode empty",
+        .func = benchSliceDecodeEmpty,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "slice decode 16 bytes",
+        .func = benchSliceDecode16,
+        .bytes_per_op = 17,
+    },
+    .{
+        .name = "slice decode 256 bytes",
+        .func = benchSliceDecode256,
+        .bytes_per_op = 258,
+    },
+    // String encode benchmarks
+    .{
+        .name = "string encode empty",
+        .func = benchStringEncodeEmpty,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "string encode 'hello'",
+        .func = benchStringEncodeHello,
+        .bytes_per_op = 6,
+    },
+    .{
+        .name = "string encode 128-byte UTF-8",
+        .func = benchStringEncode128,
+        .bytes_per_op = 130,
+    },
+    // String decode benchmarks
+    .{
+        .name = "string decode empty",
+        .func = benchStringDecodeEmpty,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "string decode 'hello'",
+        .func = benchStringDecodeHello,
+        .bytes_per_op = 6,
+    },
+    .{
+        .name = "string decode 128-byte UTF-8",
+        .func = benchStringDecode128,
+        .bytes_per_op = 130,
     },
 };
 
@@ -181,6 +268,157 @@ fn benchVleDecodeLarge() void {
 
 fn benchVleDecodeMaxU64() void {
     vleDecodeBench(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF });
+}
+
+// --- uint16 LE encode benchmarks ---
+
+fn uint16LEEncodeBench(value: u16) void {
+    var buf: [2]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    primitives.writeUint16LE(value, &writer) catch unreachable;
+    std.mem.doNotOptimizeAway(writer.buffered());
+}
+
+fn benchUint16LEEncode0() void {
+    uint16LEEncodeBench(0);
+}
+
+fn benchUint16LEEncodeMax() void {
+    uint16LEEncodeBench(0xFFFF);
+}
+
+// --- uint16 LE decode benchmarks ---
+
+fn uint16LEDecodeBench(comptime encoded: *const [2]u8) void {
+    var reader: std.Io.Reader = .fixed(encoded);
+    const result = primitives.readUint16LE(&reader) catch unreachable;
+    std.mem.doNotOptimizeAway(result);
+}
+
+fn benchUint16LEDecode0() void {
+    uint16LEDecodeBench(&[_]u8{ 0x00, 0x00 });
+}
+
+fn benchUint16LEDecodeMax() void {
+    uint16LEDecodeBench(&[_]u8{ 0xFF, 0xFF });
+}
+
+// --- Slice encode benchmarks ---
+
+fn sliceEncodeBench(comptime data: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    primitives.writeSlice(data, &writer) catch unreachable;
+    std.mem.doNotOptimizeAway(writer.buffered());
+}
+
+fn benchSliceEncodeEmpty() void {
+    sliceEncodeBench(&[_]u8{});
+}
+
+fn benchSliceEncode16() void {
+    sliceEncodeBench(&([_]u8{0xAB} ** 16));
+}
+
+fn benchSliceEncode256() void {
+    sliceEncodeBench(&([_]u8{0xCD} ** 256));
+}
+
+// --- Slice decode benchmarks ---
+
+fn sliceDecodeBench(comptime encoded: []const u8, allocator: std.mem.Allocator) void {
+    var reader: std.Io.Reader = .fixed(encoded);
+    const result = primitives.readSlice(&reader, allocator) catch unreachable;
+    std.mem.doNotOptimizeAway(result.ptr);
+    allocator.free(result);
+}
+
+// Comptime helper to build encoded slice wire data.
+fn encodeSliceComptime(comptime data: []const u8) *const [vle.encodedSize(data.len) + data.len]u8 {
+    comptime {
+        const vle_len = vle.encodedSize(data.len);
+        const total = vle_len + data.len;
+        var vle_buf: [vle.max_bytes]u8 = undefined;
+        const vle_bytes = vle.encodeToSlice(data.len, &vle_buf) catch unreachable;
+        std.debug.assert(vle_bytes.len == vle_len);
+        var result: [total]u8 = undefined;
+        @memcpy(result[0..vle_len], vle_bytes);
+        @memcpy(result[vle_len..][0..data.len], data);
+        const final = result;
+        return &final;
+    }
+}
+
+const encoded_slice_empty = encodeSliceComptime(&[_]u8{});
+const encoded_slice_16 = encodeSliceComptime(&([_]u8{0xAB} ** 16));
+const encoded_slice_256 = encodeSliceComptime(&([_]u8{0xCD} ** 256));
+
+// Use a fixed-buffer allocator for decode benchmarks to avoid hitting the system allocator.
+var bench_decode_backing: [1024]u8 = undefined;
+
+fn benchSliceDecodeEmpty() void {
+    var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
+    sliceDecodeBench(encoded_slice_empty, fba.allocator());
+}
+
+fn benchSliceDecode16() void {
+    var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
+    sliceDecodeBench(encoded_slice_16, fba.allocator());
+}
+
+fn benchSliceDecode256() void {
+    var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
+    sliceDecodeBench(encoded_slice_256, fba.allocator());
+}
+
+// --- String encode benchmarks ---
+
+fn stringEncodeBench(comptime str: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    primitives.writeString(str, &writer) catch unreachable;
+    std.mem.doNotOptimizeAway(writer.buffered());
+}
+
+fn benchStringEncodeEmpty() void {
+    stringEncodeBench("");
+}
+
+fn benchStringEncodeHello() void {
+    stringEncodeBench("hello");
+}
+
+fn benchStringEncode128() void {
+    // 128 bytes of UTF-8 text (repeating pattern)
+    stringEncodeBench("こんにちは世界！" ** 5 ++ "12345678");
+}
+
+// --- String decode benchmarks ---
+
+const encoded_string_empty = encodeSliceComptime("");
+const encoded_string_hello = encodeSliceComptime("hello");
+const encoded_string_128 = encodeSliceComptime("こんにちは世界！" ** 5 ++ "12345678");
+
+fn stringDecodeBench(comptime encoded: []const u8, allocator: std.mem.Allocator) void {
+    var reader: std.Io.Reader = .fixed(encoded);
+    const result = primitives.readString(&reader, allocator) catch unreachable;
+    std.mem.doNotOptimizeAway(result.ptr);
+    allocator.free(result);
+}
+
+fn benchStringDecodeEmpty() void {
+    var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
+    stringDecodeBench(encoded_string_empty, fba.allocator());
+}
+
+fn benchStringDecodeHello() void {
+    var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
+    stringDecodeBench(encoded_string_hello, fba.allocator());
+}
+
+fn benchStringDecode128() void {
+    var fba = std.heap.FixedBufferAllocator.init(&bench_decode_backing);
+    stringDecodeBench(encoded_string_128, fba.allocator());
 }
 
 // ---------------------------------------------------------------------------
