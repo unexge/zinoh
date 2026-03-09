@@ -1,8 +1,8 @@
 //! Transport messages: Init, Open, KeepAlive, Close, Frame.
 //!
 //! Implements encode/decode for the session handshake (InitSyn, InitAck,
-//! OpenSyn, OpenAck) and session-lifetime messages (KeepAlive, Close)
-//! per Zenoh protocol v0x09.
+//! OpenSyn, OpenAck), session-lifetime messages (KeepAlive, Close), and
+//! data transport messages (Frame) per Zenoh protocol v0x09.
 
 const std = @import("std");
 const Io = std.Io;
@@ -575,6 +575,54 @@ pub const Close = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Frame
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Frame message: wraps one or more network-layer messages.
+/// MID = 0x05, R flag (bit 5) = 1 for reliable channel.
+/// Body: seq_num (VLE), followed by network message bytes (not parsed here).
+pub const Frame = struct {
+    /// Whether this frame is on the reliable channel.
+    reliable: bool,
+    /// Frame sequence number.
+    seq_num: u64,
+
+    /// Encode the frame header (header byte + seq_num) to the writer.
+    /// The caller is responsible for writing the network message payload
+    /// after this call.
+    pub fn encodeHeader(self: *const Frame, writer: *Io.Writer) EncodeError!void {
+        // Header: |Z|x|R| MID=0x05 |
+        var header: u8 = @as(u8, MID.frame);
+        if (self.reliable) header |= Flag.bit5; // R flag
+        try writer.writeByte(header);
+
+        // Sequence number
+        try vle.encode(self.seq_num, writer);
+    }
+
+    /// Decode a frame header from the reader. The header byte has already been
+    /// parsed to determine this is a Frame (MID=0x05).
+    /// Returns the Frame with reliable flag and seq_num populated.
+    /// The remaining bytes in the transport frame are network message(s),
+    /// which the caller should read separately.
+    pub fn decodeHeader(header: u8, reader: *Io.Reader) DecodeError!Frame {
+        const r_flag = (header & Flag.bit5) != 0;
+        const z_flag = (header & Flag.z_flag) != 0;
+
+        const seq_num = try vle.decode(reader);
+
+        if (z_flag) {
+            try skipExtensions(reader);
+        }
+
+        return Frame{
+            .reliable = r_flag,
+            .seq_num = seq_num,
+        };
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Header parsing helper
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -632,6 +680,12 @@ fn encodeKeepAliveHelper(msg: *const KeepAlive, buf: []u8) []const u8 {
 fn encodeCloseHelper(msg: *const Close, buf: []u8) []const u8 {
     var writer: Io.Writer = .fixed(buf);
     msg.encode(&writer) catch unreachable;
+    return writer.buffered();
+}
+
+fn encodeFrameHeaderHelper(msg: *const Frame, buf: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buf);
+    msg.encodeHeader(&writer) catch unreachable;
     return writer.buffered();
 }
 
@@ -1555,6 +1609,180 @@ test "CloseReason: enum values match spec" {
     try testing.expectEqual(@as(u8, 0x00), @intFromEnum(CloseReason.generic));
     try testing.expectEqual(@as(u8, 0x01), @intFromEnum(CloseReason.unsupported));
     try testing.expectEqual(@as(u8, 0x02), @intFromEnum(CloseReason.invalid));
+}
+
+// ---------------------------------------------------------------------------
+// Frame tests
+// ---------------------------------------------------------------------------
+
+test "Frame: wire vector reliable sn=0 → [0x25, 0x00]" {
+    const msg = Frame{ .reliable = true, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    // Header: MID=0x05 | R=0x20 → 0x25
+    // SN: VLE(0) = 0x00
+    try assertEqualBytes(&.{ 0x25, 0x00 }, encoded);
+}
+
+test "Frame: wire vector reliable sn=42 → [0x25, 0x2A]" {
+    const msg = Frame{ .reliable = true, .seq_num = 42 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    try assertEqualBytes(&.{ 0x25, 0x2A }, encoded);
+}
+
+test "Frame: wire vector reliable sn=128 → [0x25, 0x80, 0x01]" {
+    const msg = Frame{ .reliable = true, .seq_num = 128 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    try assertEqualBytes(&.{ 0x25, 0x80, 0x01 }, encoded);
+}
+
+test "Frame: wire vector unreliable sn=0 → [0x05, 0x00]" {
+    const msg = Frame{ .reliable = false, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    // Header: MID=0x05, R=0 → 0x05
+    // SN: VLE(0) = 0x00
+    try assertEqualBytes(&.{ 0x05, 0x00 }, encoded);
+}
+
+test "Frame: wire vector unreliable sn=10000 → [0x05, 0x90, 0x4E]" {
+    const msg = Frame{ .reliable = false, .seq_num = 10000 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    try assertEqualBytes(&.{ 0x05, 0x90, 0x4E }, encoded);
+}
+
+test "Frame: MID is frame" {
+    const msg = Frame{ .reliable = true, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    try testing.expectEqual(@as(u5, MID.frame), getMid(encoded[0]));
+}
+
+test "Frame: R-flag set for reliable" {
+    const msg = Frame{ .reliable = true, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(h.isReliable());
+}
+
+test "Frame: R-flag clear for unreliable" {
+    const msg = Frame{ .reliable = false, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(!h.isReliable());
+}
+
+test "Frame: round-trip reliable sn=0" {
+    const original = Frame{ .reliable = true, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.frame), getMid(header));
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(original.reliable, decoded.reliable);
+    try testing.expectEqual(original.seq_num, decoded.seq_num);
+}
+
+test "Frame: round-trip reliable sn=42" {
+    const original = Frame{ .reliable = true, .seq_num = 42 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(true, decoded.reliable);
+    try testing.expectEqual(@as(u64, 42), decoded.seq_num);
+}
+
+test "Frame: round-trip reliable sn=128 (2-byte VLE)" {
+    const original = Frame{ .reliable = true, .seq_num = 128 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(true, decoded.reliable);
+    try testing.expectEqual(@as(u64, 128), decoded.seq_num);
+}
+
+test "Frame: round-trip reliable sn=65535 (3-byte VLE)" {
+    const original = Frame{ .reliable = true, .seq_num = 65535 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(true, decoded.reliable);
+    try testing.expectEqual(@as(u64, 65535), decoded.seq_num);
+}
+
+test "Frame: round-trip reliable sn=max u64" {
+    const original = Frame{ .reliable = true, .seq_num = 0xFFFFFFFFFFFFFFFF };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(true, decoded.reliable);
+    try testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFF), decoded.seq_num);
+}
+
+test "Frame: round-trip unreliable sn=0" {
+    const original = Frame{ .reliable = false, .seq_num = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(false, decoded.reliable);
+    try testing.expectEqual(@as(u64, 0), decoded.seq_num);
+}
+
+test "Frame: round-trip unreliable sn=10000" {
+    const original = Frame{ .reliable = false, .seq_num = 10000 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeFrameHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Frame.decodeHeader(header, &reader);
+
+    try testing.expectEqual(false, decoded.reliable);
+    try testing.expectEqual(@as(u64, 10000), decoded.seq_num);
+}
+
+test "Frame: seq_num VLE encoding consistency" {
+    // Verify that the seq_num in the Frame wire format matches standalone VLE encoding
+    const sn: u64 = 12345;
+    const frame = Frame{ .reliable = true, .seq_num = sn };
+    var frame_buf: [16]u8 = undefined;
+    const frame_encoded = encodeFrameHeaderHelper(&frame, &frame_buf);
+
+    // The VLE-encoded seq_num starts at byte 1 (after the header byte)
+    var vle_buf: [vle.max_bytes]u8 = undefined;
+    var vle_writer: Io.Writer = .fixed(&vle_buf);
+    vle.encode(sn, &vle_writer) catch unreachable;
+    const vle_encoded = vle_writer.buffered();
+
+    try testing.expectEqualSlices(u8, vle_encoded, frame_encoded[1..]);
 }
 
 test {
