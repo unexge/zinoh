@@ -27,4 +27,9 @@ pub const testing = @import("testing.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    // Recursively discover tests in inline namespace structs.
+    std.testing.refAllDecls(codec);
+    std.testing.refAllDecls(transport);
+    std.testing.refAllDecls(network);
+    std.testing.refAllDecls(zenoh);
 }

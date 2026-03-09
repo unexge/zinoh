@@ -37,15 +37,74 @@ const Benchmark = struct {
 // Benchmark registry — add new benchmarks here
 // ---------------------------------------------------------------------------
 
+const vle = zinoh.codec.vle;
+
 const benchmarks = [_]Benchmark{
     .{
         .name = "noop (baseline)",
         .func = benchNoop,
     },
+    // VLE encode benchmarks
     .{
-        .name = "vle encode 0",
-        .func = benchVleEncode0,
+        .name = "vle encode small (0)",
+        .func = benchVleEncodeSmall,
         .bytes_per_op = 1,
+    },
+    .{
+        .name = "vle encode small (127)",
+        .func = benchVleEncodeSmall127,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "vle encode medium (128)",
+        .func = benchVleEncodeMedium128,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "vle encode medium (16383)",
+        .func = benchVleEncodeMedium16383,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "vle encode large (>2^32)",
+        .func = benchVleEncodeLarge,
+        .bytes_per_op = 5,
+    },
+    .{
+        .name = "vle encode max u64",
+        .func = benchVleEncodeMaxU64,
+        .bytes_per_op = 9,
+    },
+    // VLE decode benchmarks
+    .{
+        .name = "vle decode small (0)",
+        .func = benchVleDecodeSmall,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "vle decode small (127)",
+        .func = benchVleDecodeSmall127,
+        .bytes_per_op = 1,
+    },
+    .{
+        .name = "vle decode medium (128)",
+        .func = benchVleDecodeMedium128,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "vle decode medium (16383)",
+        .func = benchVleDecodeMedium16383,
+        .bytes_per_op = 2,
+    },
+    .{
+        .name = "vle decode large (>2^32)",
+        .func = benchVleDecodeLarge,
+        .bytes_per_op = 5,
+    },
+    .{
+        .name = "vle decode max u64",
+        .func = benchVleDecodeMaxU64,
+        .bytes_per_op = 9,
     },
 };
 
@@ -58,11 +117,70 @@ fn benchNoop() void {
     std.mem.doNotOptimizeAway(@as(u8, 0));
 }
 
-fn benchVleEncode0() void {
-    // Placeholder VLE encode benchmark. Exercises the import path and
-    // provides a real measurement once vle.encode is implemented.
-    _ = zinoh.codec.vle;
-    std.mem.doNotOptimizeAway(@as(u8, 0));
+// --- VLE encode benchmarks ---
+
+fn vleEncodeBench(value: u64) void {
+    var buf: [vle.max_bytes]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    vle.encode(value, &writer) catch unreachable;
+    std.mem.doNotOptimizeAway(writer.buffered());
+}
+
+fn benchVleEncodeSmall() void {
+    vleEncodeBench(0);
+}
+
+fn benchVleEncodeSmall127() void {
+    vleEncodeBench(127);
+}
+
+fn benchVleEncodeMedium128() void {
+    vleEncodeBench(128);
+}
+
+fn benchVleEncodeMedium16383() void {
+    vleEncodeBench(16383);
+}
+
+fn benchVleEncodeLarge() void {
+    vleEncodeBench(0x1_0000_0001); // > 2^32
+}
+
+fn benchVleEncodeMaxU64() void {
+    vleEncodeBench(0xFFFFFFFFFFFFFFFF);
+}
+
+// --- VLE decode benchmarks ---
+
+fn vleDecodeBench(comptime encoded: []const u8) void {
+    var reader: std.Io.Reader = .fixed(encoded);
+    const result = vle.decode(&reader) catch unreachable;
+    std.mem.doNotOptimizeAway(result);
+}
+
+fn benchVleDecodeSmall() void {
+    vleDecodeBench(&[_]u8{0x00});
+}
+
+fn benchVleDecodeSmall127() void {
+    vleDecodeBench(&[_]u8{0x7F});
+}
+
+fn benchVleDecodeMedium128() void {
+    vleDecodeBench(&[_]u8{ 0x80, 0x01 });
+}
+
+fn benchVleDecodeMedium16383() void {
+    vleDecodeBench(&[_]u8{ 0xFF, 0x7F });
+}
+
+fn benchVleDecodeLarge() void {
+    // 0x1_0000_0001 encoded
+    vleDecodeBench(&[_]u8{ 0x81, 0x80, 0x80, 0x80, 0x10 });
+}
+
+fn benchVleDecodeMaxU64() void {
+    vleDecodeBench(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF });
 }
 
 // ---------------------------------------------------------------------------
