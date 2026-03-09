@@ -36,13 +36,21 @@ pub const Flag = struct {
 ///   if Z=1: extensions (QoS, Timestamp)
 ///   ZenohMessage: inner Put or Del message
 ///
-/// This struct encodes only the Push header + key expression.
-/// The inner Zenoh message (Put/Del) must be encoded separately after.
+/// This struct encodes/decodes only the Push header + key expression.
+/// The inner Zenoh message (Put/Del) must be encoded/decoded separately.
 pub const Push = struct {
     /// Key expression numeric ID (0 if using string-only key).
     key_scope: u64 = 0,
     /// Key expression string suffix (sets N flag when non-null).
     key_suffix: ?[]const u8 = null,
+    /// Sender's mapping (M flag). If true, key_scope is from sender's table.
+    sender_mapping: bool = false,
+
+    /// Free allocator-owned memory from a decoded Push.
+    /// Must be called with the same allocator passed to `decodeHeader`.
+    pub fn deinit(self: *const Push, allocator: Allocator) void {
+        if (self.key_suffix) |s| allocator.free(@constCast(s));
+    }
 
     /// Encode the Push header and key expression to the writer.
     /// The caller must encode the inner Zenoh message (Put/Del) immediately after.
@@ -50,8 +58,8 @@ pub const Push = struct {
         // Header: |Z|M|N| MID=0x1D |
         var header: u8 = @as(u8, MID.push);
         if (self.key_suffix != null) header |= Flag.bit5; // N flag
-        // M flag (bit 6): sender's mapping — not set (receiver's mapping)
-        // Z flag (bit 7): extensions — not yet supported
+        if (self.sender_mapping) header |= Flag.bit6; // M flag
+        // Z flag (bit 7): extensions — not yet supported for encode
         try writer.writeByte(header);
 
         // Key scope (VLE)
@@ -61,6 +69,35 @@ pub const Push = struct {
         if (self.key_suffix) |suffix| {
             try primitives.writeString(suffix, writer);
         }
+    }
+
+    /// Decode a Push header from the reader. The header byte has already been
+    /// parsed to determine this is a Push (MID=0x1D).
+    /// Returns the Push with fields populated. The remaining bytes are the
+    /// inner Zenoh message (Put/Del), which the caller should decode separately.
+    /// Caller owns key_suffix memory (if non-null) and must free with `allocator`.
+    pub fn decodeHeader(header: u8, reader: *Io.Reader, allocator: Allocator) DecodeAllocError!Push {
+        const n_flag = (header & Flag.bit5) != 0;
+        const m_flag = (header & Flag.bit6) != 0;
+        const z_flag = (header & Flag.z_flag) != 0;
+
+        const key_scope = try vle.decode(reader);
+
+        var key_suffix: ?[]u8 = null;
+        if (n_flag) {
+            key_suffix = try primitives.readString(reader, allocator);
+        }
+        errdefer if (key_suffix) |s| allocator.free(s);
+
+        if (z_flag) {
+            try skipExtensions(reader);
+        }
+
+        return Push{
+            .key_scope = key_scope,
+            .key_suffix = key_suffix,
+            .sender_mapping = m_flag,
+        };
     }
 };
 
@@ -393,12 +430,20 @@ test "Push: N flag clear when no suffix" {
     try testing.expect(!h.flag0()); // N flag not set
 }
 
-test "Push: M flag not set (receiver's mapping)" {
+test "Push: M flag not set by default (receiver's mapping)" {
     const msg = Push{ .key_suffix = "test" };
     var buf: [32]u8 = undefined;
     const encoded = encodePushHeaderHelper(&msg, &buf);
     const h = hdr.Header.decode(encoded[0]);
     try testing.expect(!h.flag1()); // M flag not set
+}
+
+test "Push: M flag set when sender_mapping is true" {
+    const msg = Push{ .key_scope = 1, .sender_mapping = true };
+    var buf: [16]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(h.flag1()); // M flag set
 }
 
 test "Push: wire compatibility — header 0x3D matches spec (N=1, M=0)" {
@@ -409,6 +454,14 @@ test "Push: wire compatibility — header 0x3D matches spec (N=1, M=0)" {
     try testing.expectEqual(@as(u8, 0x3D), encoded[0]);
 }
 
+test "Push: wire compatibility — header 0x7D for N=1, M=1" {
+    const msg = Push{ .key_scope = 0, .key_suffix = "key", .sender_mapping = true };
+    var buf: [32]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&msg, &buf);
+    // 0x7D = MID(0x1D) | N(0x20) | M(0x40)
+    try testing.expectEqual(@as(u8, 0x7D), encoded[0]);
+}
+
 test "Push: scope > 127 uses multi-byte VLE" {
     const msg = Push{ .key_scope = 200 };
     var buf: [16]u8 = undefined;
@@ -417,6 +470,236 @@ test "Push: scope > 127 uses multi-byte VLE" {
     // Header: 0x1D (no suffix)
     // Scope: VLE(200) = 0xC8 0x01
     try assertEqualBytes(&.{ 0x1D, 0xC8, 0x01 }, encoded);
+}
+
+// ---------------------------------------------------------------------------
+// Push round-trip tests
+// ---------------------------------------------------------------------------
+
+test "Push: round-trip with key scope=0, suffix='demo/example/hello'" {
+    const original = Push{
+        .key_scope = 0,
+        .key_suffix = "demo/example/hello",
+    };
+    var buf: [64]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.push), hdr.Header.decode(header).mid);
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(original.key_scope, decoded.key_scope);
+    try testing.expectEqualStrings("demo/example/hello", decoded.key_suffix.?);
+    try testing.expectEqual(false, decoded.sender_mapping);
+}
+
+test "Push: round-trip with key scope=5, no suffix" {
+    const original = Push{
+        .key_scope = 5,
+    };
+    var buf: [16]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(original.key_scope, decoded.key_scope);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
+    try testing.expectEqual(false, decoded.sender_mapping);
+}
+
+test "Push: round-trip with sender_mapping" {
+    const original = Push{
+        .key_scope = 3,
+        .key_suffix = "test/key",
+        .sender_mapping = true,
+    };
+    var buf: [32]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(original.key_scope, decoded.key_scope);
+    try testing.expectEqualStrings("test/key", decoded.key_suffix.?);
+    try testing.expectEqual(true, decoded.sender_mapping);
+}
+
+test "Push: round-trip with large key_scope" {
+    const original = Push{
+        .key_scope = 0xFFFFFFFF,
+        .key_suffix = "key",
+    };
+    var buf: [64]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(original.key_scope, decoded.key_scope);
+    try testing.expectEqualStrings("key", decoded.key_suffix.?);
+}
+
+test "Push: round-trip minimal (scope=0, no suffix, no mapping)" {
+    const original = Push{};
+    var buf: [16]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
+    try testing.expectEqual(false, decoded.sender_mapping);
+}
+
+// ---------------------------------------------------------------------------
+// Push wire vector tests
+// ---------------------------------------------------------------------------
+
+test "Push: wire vector — header=0x3D (N=1, M=0) + scope=0x00 + suffix" {
+    const msg = Push{
+        .key_scope = 0,
+        .key_suffix = "demo/example/hello",
+    };
+    var buf: [64]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&msg, &buf);
+
+    // 0x3D: header (MID=0x1D | N=0x20)
+    // 0x00: key_scope = 0
+    // 0x12: suffix length = 18
+    // "demo/example/hello": 18 bytes
+    try assertEqualBytes(
+        &(.{ 0x3D, 0x00, 0x12 } ++ "demo/example/hello".*),
+        encoded,
+    );
+}
+
+test "Push: wire vector — scope-only (N=0, M=0), scope=5" {
+    const msg = Push{ .key_scope = 5 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&msg, &buf);
+
+    // 0x1D: header (MID=0x1D, N=0, M=0)
+    // 0x05: key_scope = 5
+    try assertEqualBytes(&.{ 0x1D, 0x05 }, encoded);
+}
+
+test "Push: wire vector — N=1, M=1 header is 0x7D" {
+    const msg = Push{
+        .key_scope = 0,
+        .key_suffix = "a",
+        .sender_mapping = true,
+    };
+    var buf: [16]u8 = undefined;
+    const encoded = encodePushHeaderHelper(&msg, &buf);
+
+    // 0x7D: header (MID=0x1D | N=0x20 | M=0x40)
+    // 0x00: key_scope
+    // 0x01: suffix length = 1
+    // "a": 1 byte
+    try assertEqualBytes(&.{ 0x7D, 0x00, 0x01, 'a' }, encoded);
+}
+
+// ---------------------------------------------------------------------------
+// Push decode with extensions (Z flag)
+// ---------------------------------------------------------------------------
+
+test "Push: decode with QoS extension (ZInt, ext 0x01)" {
+    // Manually construct a Push wire message with Z=1 and a QoS extension.
+    // Header: 0xBD = MID(0x1D) | N(0x20) | Z(0x80)
+    // Scope: 0x00
+    // Suffix: VLE(3) + "key"
+    // Extension: QoS ext header=0x21 (ENC=ZInt, ID=0x01, Z=0), body=VLE(0x05)
+    const wire = .{ 0xBD, 0x00, 0x03 } ++ "key".* ++ .{ 0x21, 0x05 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.push), hdr.Header.decode(header).mid);
+
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope);
+    try testing.expectEqualStrings("key", decoded.key_suffix.?);
+    try testing.expectEqual(false, decoded.sender_mapping);
+}
+
+test "Push: decode with Timestamp extension (ZBuf, ext 0x02)" {
+    // Header: 0xBD = MID(0x1D) | N(0x20) | Z(0x80)
+    // Scope: 0x00
+    // Suffix: VLE(3) + "key"
+    // Extension: Timestamp ext header=0x42 (ENC=ZBuf, ID=0x02, Z=0), body=VLE(2) + 2 bytes
+    const wire = .{ 0xBD, 0x00, 0x03 } ++ "key".* ++ .{ 0x42, 0x02, 0xAA, 0xBB };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope);
+    try testing.expectEqualStrings("key", decoded.key_suffix.?);
+}
+
+test "Push: decode with multiple extensions (QoS + Timestamp)" {
+    // Header: 0xBD = MID(0x1D) | N(0x20) | Z(0x80)
+    // Scope: 0x00
+    // Suffix: VLE(3) + "key"
+    // Extension 1: QoS ext header=0xA1 (ENC=ZInt, ID=0x01, Z=1 more), body=VLE(0x05)
+    // Extension 2: Timestamp ext header=0x42 (ENC=ZBuf, ID=0x02, Z=0), body=VLE(2) + 2 bytes
+    const wire = .{ 0xBD, 0x00, 0x03 } ++ "key".* ++ .{ 0xA1, 0x05, 0x42, 0x02, 0xAA, 0xBB };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope);
+    try testing.expectEqualStrings("key", decoded.key_suffix.?);
+}
+
+test "Push: decode without extensions (Z=0)" {
+    // Header: 0x3D = MID(0x1D) | N(0x20), no Z
+    // Scope: 0x00
+    // Suffix: VLE(3) + "key"
+    const wire = .{ 0x3D, 0x00, 0x03 } ++ "key".*;
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope);
+    try testing.expectEqualStrings("key", decoded.key_suffix.?);
+}
+
+test "Push: decode with Unit extension (ENC=0b00)" {
+    // Header: 0x9D = MID(0x1D) | Z(0x80), no N, no M
+    // Scope: 0x05
+    // Extension: header=0x01 (ENC=Unit, ID=0x01, Z=0), no body
+    const wire = [_]u8{ 0x9D, 0x05, 0x01 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Push.decodeHeader(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 5), decoded.key_scope);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
 }
 
 // ---------------------------------------------------------------------------
