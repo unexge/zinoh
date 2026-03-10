@@ -69,6 +69,17 @@ test "session: connect and graceful close" {
     // Verify we got a remote ZenohId (router's ID should be non-empty)
     try std.testing.expect(session.remote_zid.len > 0);
 
+    // Verify negotiated values are populated correctly
+    try std.testing.expect(session.batch_size > 0);
+    try std.testing.expect(session.lease > 0);
+    // Lease in milliseconds should be plausible (>= 1s for second-based lease)
+    if (session.lease_in_seconds) {
+        try std.testing.expect(session.leaseMillis() >= 1000);
+    }
+
+    // Verify local ZenohId is preserved
+    try std.testing.expectEqualSlices(u8, zid.slice(), session.local_zid.slice());
+
     // Graceful close with generic reason
     try session.close(.generic);
 
@@ -153,6 +164,93 @@ test "session: no resource leaks (allocator check)" {
         defer session.deinit();
         try session.close(.generic);
     }
+}
+
+test "session: connect with SessionConfig" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xDE, 0xAD, 0xBE, 0xEF });
+    const config = zinoh.session.SessionConfig{
+        .zid = zid,
+        .batch_size = 4096,
+        .lease = 15,
+        .whatami = .client,
+        .patch = 1,
+    };
+
+    var session = try zinoh.session.Session.connect(allocator, io, address, config);
+    defer session.deinit();
+
+    // Verify session is open
+    try std.testing.expectEqual(zinoh.session.State.open, session.state);
+
+    // Verify local ZID is stored from config
+    try std.testing.expectEqualSlices(u8, zid.slice(), session.local_zid.slice());
+    try std.testing.expectEqualSlices(u8, zid.slice(), session.config.zid.slice());
+
+    // Verify the config is preserved
+    try std.testing.expectEqual(@as(u16, 4096), session.config.batch_size);
+    try std.testing.expectEqual(@as(u64, 15), session.config.lease);
+
+    // Verify negotiated fields are populated
+    try std.testing.expect(session.remote_zid.len > 0);
+    try std.testing.expect(session.batch_size > 0);
+    try std.testing.expect(session.lease > 0);
+
+    try session.close(.generic);
+}
+
+test "session: negotiated fields are populated correctly after handshake" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0x11, 0x22, 0x33 });
+    var session = try zinoh.session.Session.open(allocator, io, address, zid);
+    defer session.deinit();
+
+    // Remote ZID should be valid (non-zero length, at most 16 bytes)
+    try std.testing.expect(session.remote_zid.len >= 1);
+    try std.testing.expect(session.remote_zid.len <= 16);
+
+    // Remote ZID should differ from local ZID
+    try std.testing.expect(!std.mem.eql(u8, session.local_zid.slice(), session.remote_zid.slice()));
+
+    // Batch size: should be positive and at most our proposed size (2048 default)
+    try std.testing.expect(session.batch_size > 0);
+    try std.testing.expect(session.batch_size <= session.config.batch_size);
+
+    // Lease: should be positive
+    try std.testing.expect(session.lease > 0);
+
+    // Resolution: should have valid frame_sn bits
+    const fsn = session.resolution.frame_sn;
+    try std.testing.expect(fsn == .bits_8 or fsn == .bits_16 or fsn == .bits_32 or fsn == .bits_64);
+
+    // tx_sn: should be bounded by the resolution mask
+    const sn_mask: u64 = switch (session.resolution.frame_sn) {
+        .bits_8 => 0xFF,
+        .bits_16 => 0xFFFF,
+        .bits_32 => 0xFFFFFFFF,
+        .bits_64 => std.math.maxInt(u64),
+    };
+    try std.testing.expect(session.tx_sn <= sn_mask);
+
+    try session.close(.generic);
 }
 
 // ---------------------------------------------------------------------------

@@ -24,20 +24,31 @@ const KeepAlive = transport.KeepAlive;
 const ZenohId = transport.ZenohId;
 const Resolution = transport.Resolution;
 
-/// Default client batch size (matches zenoh-pico).
-const default_batch_size: u16 = 2048;
-
-/// Default lease in seconds.
-const default_lease: u64 = 10;
-
-/// Default patch level.
-const default_patch: u64 = 1;
-
 /// Buffer size for TCP I/O operations.
 const io_buffer_size: usize = 4096;
 
 /// Polling interval for interruptible sleep in the keepalive loop (ms).
 const keepalive_poll_interval_ms: i64 = 100;
+
+/// Configuration for establishing a Zenoh session.
+///
+/// Provides all client-side parameters used during the 4-message handshake
+/// (InitSyn/OpenSyn). Negotiated values may differ from these after the
+/// router responds with InitAck/OpenAck.
+pub const SessionConfig = struct {
+    /// Local Zenoh ID for this client.
+    zid: ZenohId,
+    /// Desired batch size (may be lowered by router during negotiation).
+    batch_size: u16 = 2048,
+    /// Desired lease duration in seconds (router may negotiate a different value).
+    lease: u64 = 10,
+    /// Node role for this endpoint.
+    whatami: transport.WhatAmI = .client,
+    /// Protocol patch level.
+    patch: u64 = 1,
+    /// Initial resolution proposal. If null, defaults are used.
+    resolution: ?Resolution = null,
+};
 
 /// Session state.
 pub const State = enum {
@@ -84,7 +95,10 @@ pub const Session = struct {
     stream: net.Stream,
     state: State,
 
-    /// Our Zenoh ID.
+    /// Session configuration (client-side parameters).
+    config: SessionConfig,
+
+    /// Our Zenoh ID (copied from config.zid at creation time).
     local_zid: ZenohId,
     /// Remote (router) Zenoh ID, set after handshake.
     remote_zid: ZenohId,
@@ -127,7 +141,9 @@ pub const Session = struct {
     ///   4. Receive OpenAck
     ///
     /// On success, the session is in `State.open` and ready for use.
-    pub fn open(allocator: Allocator, io: Io, address: net.IpAddress, local_zid: ZenohId) OpenError!Session {
+    /// The `config` parameter provides client-side settings; negotiated
+    /// values (from the router's responses) are stored in the session.
+    pub fn connect(allocator: Allocator, io: Io, address: net.IpAddress, config: SessionConfig) OpenError!Session {
         // Allocate I/O buffers.
         const read_buf = allocator.alloc(u8, io_buffer_size) catch
             return @as(OpenError, error.SystemResources);
@@ -146,11 +162,12 @@ pub const Session = struct {
             .io = io,
             .stream = stream,
             .state = .connecting,
-            .local_zid = local_zid,
+            .config = config,
+            .local_zid = config.zid,
             .remote_zid = .{},
-            .resolution = Resolution{},
-            .batch_size = default_batch_size,
-            .lease = default_lease,
+            .resolution = config.resolution orelse Resolution{},
+            .batch_size = config.batch_size,
+            .lease = config.lease,
             .lease_in_seconds = true,
             .tx_sn = 0,
             .rx_sn = 0,
@@ -163,16 +180,24 @@ pub const Session = struct {
         return session;
     }
 
+    /// Open a new session to a Zenoh router (convenience wrapper).
+    ///
+    /// Creates a `SessionConfig` with the given `local_zid` and default
+    /// parameters, then calls `connect()`.
+    pub fn open(allocator: Allocator, io: Io, address: net.IpAddress, local_zid: ZenohId) OpenError!Session {
+        return connect(allocator, io, address, .{ .zid = local_zid });
+    }
+
     /// Perform the 4-message handshake.
     fn performHandshake(self: *Session) OpenError!void {
         // 1. Send InitSyn
         const init_syn = InitSyn{
             .version = transport.protocol_version,
-            .whatami = .client,
-            .zid = self.local_zid,
-            .resolution = Resolution{},
-            .batch_size = default_batch_size,
-            .patch = default_patch,
+            .whatami = self.config.whatami,
+            .zid = self.config.zid,
+            .resolution = self.config.resolution orelse Resolution{},
+            .batch_size = self.config.batch_size,
+            .patch = self.config.patch,
         };
         try self.sendMessage(InitSyn, &init_syn);
 
@@ -193,7 +218,7 @@ pub const Session = struct {
             self.resolution = res;
         }
         if (init_ack.batch_size) |bs| {
-            self.batch_size = bs;
+            self.batch_size = @min(bs, self.config.batch_size);
         }
 
         // 3. Send OpenSyn (echo cookie)
@@ -209,7 +234,7 @@ pub const Session = struct {
         self.tx_sn = std.mem.readInt(u64, &sn_bytes, .little) & sn_mask;
 
         const open_syn = OpenSyn{
-            .lease = default_lease,
+            .lease = self.config.lease,
             .lease_in_seconds = true,
             .initial_sn = self.tx_sn,
             .cookie = init_ack.cookie,
@@ -584,6 +609,115 @@ test "KeepAlive: framed wire bytes (with 2-byte length prefix)" {
     const framed = frame_writer.buffered();
 
     try assertEqualBytes(&.{ 0x01, 0x00, 0x04 }, framed);
+}
+
+// ---------------------------------------------------------------------------
+// SessionConfig tests
+// ---------------------------------------------------------------------------
+
+test "SessionConfig: default values" {
+    const zid = try ZenohId.init(&.{0x01});
+    const config = SessionConfig{ .zid = zid };
+    try testing.expectEqual(@as(u16, 2048), config.batch_size);
+    try testing.expectEqual(@as(u64, 10), config.lease);
+    try testing.expectEqual(transport.WhatAmI.client, config.whatami);
+    try testing.expectEqual(@as(u64, 1), config.patch);
+    try testing.expectEqual(@as(?Resolution, null), config.resolution);
+}
+
+test "SessionConfig: custom values" {
+    const zid = try ZenohId.init(&.{ 0x01, 0x02 });
+    const config = SessionConfig{
+        .zid = zid,
+        .batch_size = 4096,
+        .lease = 30,
+        .whatami = .peer,
+        .patch = 2,
+        .resolution = Resolution{ .frame_sn = .bits_16 },
+    };
+    try testing.expectEqual(@as(u16, 4096), config.batch_size);
+    try testing.expectEqual(@as(u64, 30), config.lease);
+    try testing.expectEqual(transport.WhatAmI.peer, config.whatami);
+    try testing.expectEqual(@as(u64, 2), config.patch);
+    try testing.expect(config.resolution != null);
+}
+
+// ---------------------------------------------------------------------------
+// Handshake decode error tests (version mismatch, unexpected message, etc.)
+// ---------------------------------------------------------------------------
+
+test "InitAck: encode/decode round-trip preserves wrong version for detection" {
+    // Construct an InitAck with a wrong version (0x08 instead of 0x09).
+    // Verify that after encode/decode the version field is preserved,
+    // which is how performHandshake detects a version mismatch.
+    const router_zid = try ZenohId.init(&.{0xAA});
+    const cookie = [_]u8{ 0x01, 0x02 };
+    const init_ack = InitAck{
+        .version = 0x08, // wrong version
+        .whatami = .router,
+        .zid = router_zid,
+        .cookie = &cookie,
+    };
+    var buf: [128]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try init_ack.encode(&writer);
+    const encoded = writer.buffered();
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const mid = transport.getMid(header);
+    try testing.expectEqual(@as(u5, transport.MID.init), mid);
+    try testing.expect(transport.isAck(header));
+
+    const decoded = try InitAck.decodeAlloc(header, &reader, testing.allocator);
+    defer testing.allocator.free(decoded.cookie);
+
+    // The decoded version should differ from the protocol version,
+    // which performHandshake would reject as VersionMismatch.
+    try testing.expectEqual(@as(u8, 0x08), decoded.version);
+    try testing.expect(decoded.version != transport.protocol_version);
+}
+
+test "Close vs InitAck: MID distinguishes Close from Init" {
+    // Encode a Close message and verify its MID differs from Init,
+    // which is how decodeInitAck detects receiving the wrong message type.
+    const close_msg = Close{ .session = true, .reason = .generic };
+    var buf: [16]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try close_msg.encode(&writer);
+    const encoded = writer.buffered();
+
+    // Try to decode as InitAck — should detect wrong MID.
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const mid = transport.getMid(header);
+
+    // MID should be Close (0x03), not Init (0x01).
+    // decodeInitAck would return InvalidMid for this header.
+    try testing.expectEqual(@as(u5, transport.MID.close), mid);
+    try testing.expect(mid != transport.MID.init);
+}
+
+test "OpenSyn: Ack flag is not set (distinguishes Syn from Ack)" {
+    // Encode an OpenSyn and verify the A flag is clear,
+    // which is how decodeOpenAck detects receiving a Syn instead of an Ack.
+    const cookie = [_]u8{ 0x01, 0x02 };
+    const open_syn = OpenSyn{
+        .lease = 10,
+        .lease_in_seconds = true,
+        .initial_sn = 0,
+        .cookie = &cookie,
+    };
+    var buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try open_syn.encode(&writer);
+    const encoded = writer.buffered();
+
+    // A flag must not be set (it's a Syn, not an Ack).
+    // decodeOpenAck would return UnexpectedMessage for this header.
+    try testing.expect(!transport.isAck(encoded[0]));
+    // But MID is correct (Open)
+    try testing.expectEqual(@as(u5, transport.MID.open), transport.getMid(encoded[0]));
 }
 
 test {
