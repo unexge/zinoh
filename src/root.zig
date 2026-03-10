@@ -12,6 +12,7 @@ pub const codec = struct {
 pub const transport = struct {
     pub const messages = @import("transport/messages.zig");
     pub const framing = @import("transport/framing.zig");
+    pub const tcp = @import("transport/tcp.zig");
 };
 
 pub const network = struct {

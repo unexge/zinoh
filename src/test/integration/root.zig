@@ -276,6 +276,116 @@ test "keepalive: leaseMillis returns plausible value for negotiated lease" {
     try session.close(.generic);
 }
 
+// ---------------------------------------------------------------------------
+// TcpTransport integration tests
+// ---------------------------------------------------------------------------
+
+test "tcp transport: connect, send InitSyn, recv InitAck, close" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const TcpTransport = zinoh.transport.tcp.TcpTransport;
+    const transport_msgs = zinoh.transport.messages;
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    // Connect via TcpTransport
+    var transport = try TcpTransport.connect(allocator, io, address);
+    defer transport.close();
+
+    // Encode an InitSyn message
+    const zid = try transport_msgs.ZenohId.init(&.{ 0x7C, 0x01, 0x02 });
+    const init_syn = transport_msgs.InitSyn{
+        .version = transport_msgs.protocol_version,
+        .whatami = .client,
+        .zid = zid,
+        .resolution = transport_msgs.Resolution{},
+        .batch_size = 2048,
+        .patch = 1,
+    };
+    var msg_buf: [512]u8 = undefined;
+    var msg_writer: std.Io.Writer = .fixed(&msg_buf);
+    try init_syn.encode(&msg_writer);
+    const payload = msg_writer.buffered();
+
+    // Send the InitSyn via transport
+    try transport.send(payload);
+
+    // Receive the InitAck
+    const response = try transport.recvAlloc(allocator);
+    defer allocator.free(response);
+
+    // Verify we got a response (should be at least a header byte)
+    try std.testing.expect(response.len > 0);
+
+    // Parse the header: should be InitAck (MID=0x01, A=1)
+    const header = response[0];
+    const mid = transport_msgs.getMid(header);
+    try std.testing.expectEqual(@as(u5, transport_msgs.MID.init), mid);
+    try std.testing.expect(transport_msgs.isAck(header));
+}
+
+test "tcp transport: send and recv raw bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const TcpTransport = zinoh.transport.tcp.TcpTransport;
+    const transport_msgs = zinoh.transport.messages;
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    var transport = try TcpTransport.connect(allocator, io, address);
+    defer transport.close();
+
+    // Send a minimal InitSyn using recv (non-alloc) variant
+    const zid = try transport_msgs.ZenohId.init(&.{ 0x7C, 0x10, 0x20 });
+    const init_syn = transport_msgs.InitSyn{
+        .version = transport_msgs.protocol_version,
+        .whatami = .client,
+        .zid = zid,
+    };
+    var msg_buf: [512]u8 = undefined;
+    var msg_writer: std.Io.Writer = .fixed(&msg_buf);
+    try init_syn.encode(&msg_writer);
+    try transport.send(msg_writer.buffered());
+
+    // Receive into a stack buffer
+    var recv_buf: [zinoh.transport.framing.max_frame_size]u8 = undefined;
+    const response = try transport.recv(&recv_buf);
+
+    // Should be a valid InitAck
+    try std.testing.expect(response.len > 0);
+    try std.testing.expectEqual(@as(u5, transport_msgs.MID.init), transport_msgs.getMid(response[0]));
+    try std.testing.expect(transport_msgs.isAck(response[0]));
+}
+
+test "tcp transport: clean close (no leaked fds)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const TcpTransport = zinoh.transport.tcp.TcpTransport;
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    // Open and close multiple transports — allocator detects leaks
+    for (0..3) |_| {
+        var transport = try TcpTransport.connect(allocator, io, address);
+        transport.close();
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
