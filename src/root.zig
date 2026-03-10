@@ -16,6 +16,7 @@ pub const transport = struct {
 };
 
 pub const network = struct {
+    pub const key_expr = @import("network/key_expr.zig");
     pub const messages = @import("network/messages.zig");
 };
 
