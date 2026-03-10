@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 const vle = @import("../codec/vle.zig");
 const primitives = @import("../codec/primitives.zig");
 const hdr = @import("../codec/header.zig");
+const transport = @import("../transport/messages.zig");
+const ZenohId = transport.ZenohId;
 
 /// Zenoh-layer message IDs.
 pub const MID = hdr.ZenohMid;
@@ -21,6 +23,42 @@ pub const Flag = struct {
     pub const bit6: u8 = 0x40;
     /// Bit 7 (0x80): Z=extensions present.
     pub const z_flag: u8 = 0x80;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Timestamp (§2.9)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Timestamp: a NTP64 time with a ZenohId identifying the source.
+///
+/// Wire format (§2.9):
+///   VLE: time (NTP64 encoded as VLE)
+///   u8: zid_len (length of the ZenohId bytes)
+///   [zid_len]u8: ZenohId bytes
+pub const Timestamp = struct {
+    time: u64,
+    id: ZenohId,
+
+    /// Encode this Timestamp to the writer.
+    pub fn encode(self: *const Timestamp, writer: *Io.Writer) Io.Writer.Error!void {
+        try vle.encode(self.time, writer);
+        try writer.writeByte(@intCast(self.id.len));
+        try writer.writeAll(self.id.slice());
+    }
+
+    /// Decode a Timestamp from the reader.
+    pub fn decode(reader: *Io.Reader) DecodeError!Timestamp {
+        const time = try vle.decode(reader);
+        const zid_len: u8 = try reader.takeByte();
+        if (zid_len == 0 or zid_len > ZenohId.max_len) return error.InvalidZenohIdLength;
+        var id = ZenohId{};
+        id.len = @intCast(zid_len);
+        try reader.readSliceAll(id.bytes[0..zid_len]);
+        return Timestamp{
+            .time = time,
+            .id = id,
+        };
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -74,9 +112,9 @@ pub const Encoding = struct {
 // Error types
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const DecodeError = Io.Reader.Error || error{InvalidMid};
+pub const DecodeError = Io.Reader.Error || error{ InvalidMid, InvalidZenohIdLength };
 
-pub const DecodeAllocError = Io.Reader.Error || Io.Reader.ReadAllocError || error{InvalidMid};
+pub const DecodeAllocError = Io.Reader.Error || Io.Reader.ReadAllocError || error{ InvalidMid, InvalidZenohIdLength };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Extension helpers
@@ -126,9 +164,10 @@ fn skipExtensions(reader: *Io.Reader) DecodeError!void {
 ///   if Z=1: extensions
 ///   payload: VLE-length-prefixed bytes
 pub const Put = struct {
+    /// Optional timestamp (sets T flag when present).
+    timestamp: ?Timestamp = null,
     /// Optional encoding (sets E flag when present).
     encoding: ?Encoding = null,
-    // timestamp: not yet implemented (would set T flag)
     /// Payload bytes.
     payload: []const u8,
 
@@ -143,10 +182,15 @@ pub const Put = struct {
     pub fn encode(self: *const Put, writer: *Io.Writer) Io.Writer.Error!void {
         // Header: |Z|E|T| MID=0x01 |
         var header: u8 = @as(u8, MID.put);
-        // T flag (bit 5): timestamp present — not yet supported
+        if (self.timestamp != null) header |= Flag.bit5; // T flag
         if (self.encoding != null) header |= Flag.bit6; // E flag
         // Z flag (bit 7): extensions — not yet supported
         try writer.writeByte(header);
+
+        // Timestamp (if T=1)
+        if (self.timestamp) |ts| {
+            try ts.encode(writer);
+        }
 
         // Encoding (if E=1)
         if (self.encoding) |enc| {
@@ -165,12 +209,10 @@ pub const Put = struct {
         const e_flag = (header & Flag.bit6) != 0;
         const z_flag = (header & Flag.z_flag) != 0;
 
-        // Timestamp (if T=1) — not yet supported, skip
+        // Timestamp (if T=1)
+        var timestamp: ?Timestamp = null;
         if (t_flag) {
-            // timestamp = VLE time + 1-byte zid_len + zid_len bytes (§2.9)
-            _ = try vle.decode(reader);
-            const zid_len: usize = try reader.takeByte();
-            try reader.discardAll(@intCast(zid_len));
+            timestamp = try Timestamp.decode(reader);
         }
 
         var encoding: ?Encoding = null;
@@ -186,6 +228,7 @@ pub const Put = struct {
         const payload = try primitives.readSlice(reader, allocator);
 
         return Put{
+            .timestamp = timestamp,
             .encoding = encoding,
             .payload = payload,
         };
@@ -203,16 +246,21 @@ pub const Put = struct {
 ///   if T=1: timestamp (VLE time + ZenohID)
 ///   if Z=1: extensions
 pub const Del = struct {
-    // timestamp: not yet implemented (would set T flag)
+    /// Optional timestamp (sets T flag when present).
+    timestamp: ?Timestamp = null,
 
     /// Encode this Del message to the writer.
     pub fn encode(self: *const Del, writer: *Io.Writer) Io.Writer.Error!void {
-        _ = self;
         // Header: |Z|X|T| MID=0x02 |
-        const header: u8 = @as(u8, MID.del);
-        // T flag (bit 5): timestamp present — not yet supported
+        var header: u8 = @as(u8, MID.del);
+        if (self.timestamp != null) header |= Flag.bit5; // T flag
         // Z flag (bit 7): extensions — not yet supported
         try writer.writeByte(header);
+
+        // Timestamp (if T=1)
+        if (self.timestamp) |ts| {
+            try ts.encode(writer);
+        }
     }
 
     /// Decode a Del message from the reader. The header byte has already been
@@ -221,19 +269,19 @@ pub const Del = struct {
         const t_flag = (header & Flag.bit5) != 0;
         const z_flag = (header & Flag.z_flag) != 0;
 
-        // Timestamp (if T=1) — not yet supported, skip
+        // Timestamp (if T=1)
+        var timestamp: ?Timestamp = null;
         if (t_flag) {
-            // timestamp = VLE time + 1-byte zid_len + zid_len bytes (§2.9)
-            _ = try vle.decode(reader);
-            const zid_len: usize = try reader.takeByte();
-            try reader.discardAll(@intCast(zid_len));
+            timestamp = try Timestamp.decode(reader);
         }
 
         if (z_flag) {
             try skipExtensions(reader);
         }
 
-        return Del{};
+        return Del{
+            .timestamp = timestamp,
+        };
     }
 };
 
@@ -473,6 +521,91 @@ pub const Err = struct {
 
 const testing = std.testing;
 const assertEqualBytes = @import("../testing.zig").assertEqualBytes;
+
+// ---------------------------------------------------------------------------
+// Timestamp tests
+// ---------------------------------------------------------------------------
+
+fn encodeTimestampHelper(ts: *const Timestamp, buf: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buf);
+    ts.encode(&writer) catch unreachable;
+    return writer.buffered();
+}
+
+test "Timestamp: encode time=0, 1-byte ZenohId" {
+    const zid = ZenohId.init(&.{0x42}) catch unreachable;
+    const ts = Timestamp{ .time = 0, .id = zid };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeTimestampHelper(&ts, &buf);
+    // VLE(0) = 0x00, zid_len = 0x01, zid = 0x42
+    try assertEqualBytes(&.{ 0x00, 0x01, 0x42 }, encoded);
+}
+
+test "Timestamp: encode time=1000, 3-byte ZenohId" {
+    const zid = ZenohId.init(&.{ 0xAA, 0xBB, 0xCC }) catch unreachable;
+    const ts = Timestamp{ .time = 1000, .id = zid };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeTimestampHelper(&ts, &buf);
+    // VLE(1000) = 0xE8 0x07, zid_len = 0x03, zid = AA BB CC
+    try assertEqualBytes(&.{ 0xE8, 0x07, 0x03, 0xAA, 0xBB, 0xCC }, encoded);
+}
+
+test "Timestamp: round-trip time=0, 1-byte ZenohId" {
+    const zid = ZenohId.init(&.{0x42}) catch unreachable;
+    const ts = Timestamp{ .time = 0, .id = zid };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeTimestampHelper(&ts, &buf);
+    var reader: Io.Reader = .fixed(encoded);
+    const decoded = try Timestamp.decode(&reader);
+    try testing.expectEqual(@as(u64, 0), decoded.time);
+    try testing.expectEqualSlices(u8, &.{0x42}, decoded.id.slice());
+}
+
+test "Timestamp: round-trip time=1000, 3-byte ZenohId" {
+    const zid = ZenohId.init(&.{ 0xAA, 0xBB, 0xCC }) catch unreachable;
+    const ts = Timestamp{ .time = 1000, .id = zid };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeTimestampHelper(&ts, &buf);
+    var reader: Io.Reader = .fixed(encoded);
+    const decoded = try Timestamp.decode(&reader);
+    try testing.expectEqual(@as(u64, 1000), decoded.time);
+    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC }, decoded.id.slice());
+}
+
+test "Timestamp: round-trip large time value" {
+    const zid = ZenohId.init(&.{0x01}) catch unreachable;
+    const ts = Timestamp{ .time = 0x123456789ABCDEF0, .id = zid };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeTimestampHelper(&ts, &buf);
+    var reader: Io.Reader = .fixed(encoded);
+    const decoded = try Timestamp.decode(&reader);
+    try testing.expectEqual(@as(u64, 0x123456789ABCDEF0), decoded.time);
+    try testing.expectEqualSlices(u8, &.{0x01}, decoded.id.slice());
+}
+
+test "Timestamp: round-trip 16-byte ZenohId (max length)" {
+    const zid_bytes = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
+    const zid = ZenohId.init(&zid_bytes) catch unreachable;
+    const ts = Timestamp{ .time = 42, .id = zid };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeTimestampHelper(&ts, &buf);
+    var reader: Io.Reader = .fixed(encoded);
+    const decoded = try Timestamp.decode(&reader);
+    try testing.expectEqual(@as(u64, 42), decoded.time);
+    try testing.expectEqualSlices(u8, &zid_bytes, decoded.id.slice());
+}
+
+test "Timestamp: decode rejects zid_len=0" {
+    // VLE(42) = 0x2A, then zid_len = 0x00 (invalid: must be >= 1)
+    var reader: Io.Reader = .fixed(&.{ 0x2A, 0x00 });
+    try testing.expectError(error.InvalidZenohIdLength, Timestamp.decode(&reader));
+}
+
+test "Timestamp: decode rejects zid_len > 16" {
+    // VLE(42) = 0x2A, then zid_len = 17 (invalid: max is 16)
+    var reader: Io.Reader = .fixed(&.{ 0x2A, 17 });
+    try testing.expectError(error.InvalidZenohIdLength, Timestamp.decode(&reader));
+}
 
 // ---------------------------------------------------------------------------
 // Encoding tests
@@ -723,6 +856,95 @@ test "Put: round-trip empty payload" {
     try testing.expectEqualStrings("", decoded.payload);
 }
 
+test "Put: with timestamp (T flag set)" {
+    const zid = ZenohId.init(&.{0x42}) catch unreachable;
+    const msg = Put{
+        .timestamp = .{ .time = 100, .id = zid },
+        .payload = "data",
+    };
+    var buf: [64]u8 = undefined;
+    const encoded = encodePutHelper(&msg, &buf);
+
+    // Header: 0x21 (MID=0x01 | T=0x20)
+    try testing.expectEqual(@as(u8, 0x21), encoded[0]);
+    // T flag set
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(h.flag0()); // T flag (bit 5)
+}
+
+test "Put: T flag clear when no timestamp" {
+    const msg = Put{ .payload = "x" };
+    var buf: [16]u8 = undefined;
+    const encoded = encodePutHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(!h.flag0()); // T flag (bit 5) not set
+}
+
+test "Put: round-trip with timestamp" {
+    const zid = ZenohId.init(&.{ 0xDE, 0xAD }) catch unreachable;
+    const msg = Put{
+        .timestamp = .{ .time = 42, .id = zid },
+        .payload = "hello",
+    };
+    var buf: [64]u8 = undefined;
+    const encoded = encodePutHelper(&msg, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Put.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expect(decoded.timestamp != null);
+    try testing.expectEqual(@as(u64, 42), decoded.timestamp.?.time);
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD }, decoded.timestamp.?.id.slice());
+    try testing.expectEqual(@as(?Encoding, null), decoded.encoding);
+    try testing.expectEqualStrings("hello", decoded.payload);
+}
+
+test "Put: round-trip with all fields (timestamp + encoding + payload)" {
+    const zid = ZenohId.init(&.{ 0x01, 0x02, 0x03 }) catch unreachable;
+    const msg = Put{
+        .timestamp = .{ .time = 1000, .id = zid },
+        .encoding = .{ .id = 10, .schema = "application/json" },
+        .payload = "{\"key\":\"value\"}",
+    };
+    var buf: [128]u8 = undefined;
+    const encoded = encodePutHelper(&msg, &buf);
+
+    // Header should have both T and E flags set: 0x61 (MID=0x01 | T=0x20 | E=0x40)
+    try testing.expectEqual(@as(u8, 0x61), encoded[0]);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Put.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expect(decoded.timestamp != null);
+    try testing.expectEqual(@as(u64, 1000), decoded.timestamp.?.time);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03 }, decoded.timestamp.?.id.slice());
+    try testing.expectEqual(@as(u16, 10), decoded.encoding.?.id);
+    try testing.expectEqualStrings("application/json", decoded.encoding.?.schema.?);
+    try testing.expectEqualStrings("{\"key\":\"value\"}", decoded.payload);
+}
+
+test "Put: wire vector — 'Hello World!' with default encoding" {
+    // Put with default encoding (id=0, no schema) and payload "Hello World!"
+    const msg = Put{
+        .encoding = .{ .id = 0 },
+        .payload = "Hello World!",
+    };
+    var buf: [64]u8 = undefined;
+    const encoded = encodePutHelper(&msg, &buf);
+
+    // Header: 0x41 (MID=0x01 | E=0x40)
+    // Encoding: VLE(0) = 0x00 (id=0, no schema → (0<<1)|0 = 0)
+    // Payload: VLE(12) = 0x0C + "Hello World!"
+    try assertEqualBytes(
+        &(.{ 0x41, 0x00, 0x0C } ++ "Hello World!".*),
+        encoded,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Del tests
 // ---------------------------------------------------------------------------
@@ -756,7 +978,60 @@ test "Del: round-trip" {
 
     var reader: Io.Reader = .fixed(encoded);
     const header = try reader.takeByte();
-    _ = try Del.decode(header, &reader);
+    const decoded = try Del.decode(header, &reader);
+    try testing.expectEqual(@as(?Timestamp, null), decoded.timestamp);
+}
+
+test "Del: with timestamp (T flag set)" {
+    const zid = ZenohId.init(&.{0x42}) catch unreachable;
+    const msg = Del{
+        .timestamp = .{ .time = 100, .id = zid },
+    };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeDelHelper(&msg, &buf);
+
+    // Header: 0x22 (MID=0x02 | T=0x20)
+    try testing.expectEqual(@as(u8, 0x22), encoded[0]);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(h.flag0()); // T flag (bit 5)
+}
+
+test "Del: T flag clear when no timestamp" {
+    const msg = Del{};
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDelHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(!h.flag0()); // T flag not set
+}
+
+test "Del: round-trip with timestamp" {
+    const zid = ZenohId.init(&.{ 0xDE, 0xAD }) catch unreachable;
+    const msg = Del{
+        .timestamp = .{ .time = 42, .id = zid },
+    };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeDelHelper(&msg, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Del.decode(header, &reader);
+
+    try testing.expect(decoded.timestamp != null);
+    try testing.expectEqual(@as(u64, 42), decoded.timestamp.?.time);
+    try testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD }, decoded.timestamp.?.id.slice());
+}
+
+test "Del: wire vector — del with timestamp" {
+    const zid = ZenohId.init(&.{0x01}) catch unreachable;
+    const msg = Del{
+        .timestamp = .{ .time = 0, .id = zid },
+    };
+    var buf: [32]u8 = undefined;
+    const encoded = encodeDelHelper(&msg, &buf);
+
+    // Header: 0x22 (MID=0x02 | T=0x20)
+    // Timestamp: VLE(0) = 0x00, zid_len = 0x01, zid = 0x01
+    try assertEqualBytes(&.{ 0x22, 0x00, 0x01, 0x01 }, encoded);
 }
 
 // ---------------------------------------------------------------------------
