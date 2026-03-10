@@ -484,6 +484,202 @@ test "tcp transport: clean close (no leaked fds)" {
     }
 }
 
+// ---------------------------------------------------------------------------
+// z_put integration tests
+// ---------------------------------------------------------------------------
+
+test "z_put: publish to zenohd succeeds without error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xA0, 0xA1, 0xA2 });
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    var session = try zinoh.session.Session.open(allocator, io, address, zid);
+    defer session.deinit();
+    try std.testing.expectEqual(zinoh.session.State.open, session.state);
+
+    // Put a value — should succeed without error.
+    try session.put("demo/example/hello", "Hello World!", .{});
+
+    // Session should still be open after put.
+    try std.testing.expectEqual(zinoh.session.State.open, session.state);
+
+    try session.close(.generic);
+}
+
+test "z_put: multiple puts with incrementing sequence numbers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xB0, 0xB1, 0xB2 });
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    var session = try zinoh.session.Session.open(allocator, io, address, zid);
+    defer session.deinit();
+
+    const initial_sn = session.tx_sn;
+
+    // Put several values.
+    try session.put("test/key1", "value1", .{});
+    try session.put("test/key2", "value2", .{});
+    try session.put("test/key3", "value3", .{});
+
+    // SN should have advanced by 3.
+    const sn_mask: u64 = switch (session.resolution.frame_sn) {
+        .bits_8 => 0xFF,
+        .bits_16 => 0xFFFF,
+        .bits_32 => 0xFFFFFFFF,
+        .bits_64 => std.math.maxInt(u64),
+    };
+    const expected_sn = (initial_sn +% 3) & sn_mask;
+    try std.testing.expectEqual(expected_sn, session.tx_sn);
+
+    try session.close(.generic);
+}
+
+test "z_put: with encoding option" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xC0, 0xC1, 0xC2 });
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    var session = try zinoh.session.Session.open(allocator, io, address, zid);
+    defer session.deinit();
+
+    // Put with explicit encoding.
+    try session.put("demo/encoded", "{\"key\":\"value\"}", .{
+        .encoding = .{ .id = 10 },
+    });
+
+    try session.close(.generic);
+}
+
+// ---------------------------------------------------------------------------
+// z_get integration tests
+// ---------------------------------------------------------------------------
+
+test "z_get: query with no stored data returns empty result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xD0, 0xD1, 0xD2 });
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    var session = try zinoh.session.Session.open(allocator, io, address, zid);
+    defer session.deinit();
+
+    // Query a key that has no stored data.
+    const result = try session.get("demo/nonexistent/key", .{});
+    defer result.deinit(allocator);
+
+    // Should get zero replies (ResponseFinal immediately).
+    try std.testing.expectEqual(@as(usize, 0), result.replies.len);
+
+    try session.close(.generic);
+}
+
+test "z_get: put then get round-trip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    // First session: put a value.
+    {
+        const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xE0, 0xE1, 0xE2 });
+        var session = try zinoh.session.Session.open(allocator, io, address, zid);
+        defer session.deinit();
+
+        try session.put("demo/test/roundtrip", "Hello Zinoh!", .{});
+        try session.close(.generic);
+    }
+
+    // Brief pause for the router to process the put.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+
+    // Second session: get the value back.
+    {
+        const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xF0, 0xF1, 0xF2 });
+        var session = try zinoh.session.Session.open(allocator, io, address, zid);
+        defer session.deinit();
+
+        const result = try session.get("demo/test/roundtrip", .{});
+        defer result.deinit(allocator);
+
+        // We should get at least one reply with the value we put.
+        try std.testing.expect(result.replies.len >= 1);
+
+        // Find a reply with our payload.
+        var found = false;
+        for (result.replies) |reply| {
+            if (std.mem.eql(u8, reply.payload, "Hello Zinoh!")) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+
+        try session.close(.generic);
+    }
+}
+
+test "z_get: request_id is properly incremented" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try ensureZenohd(allocator, io)) return;
+    defer helpers.stopZenohd(allocator, io);
+
+    try helpers.waitForReady(io);
+
+    const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xA1, 0xB1, 0xC1 });
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    var session = try zinoh.session.Session.open(allocator, io, address, zid);
+    defer session.deinit();
+
+    const initial_rid = session.next_request_id;
+
+    // Perform two queries.
+    const r1 = try session.get("demo/nonexistent1", .{});
+    defer r1.deinit(allocator);
+
+    const r2 = try session.get("demo/nonexistent2", .{});
+    defer r2.deinit(allocator);
+
+    // Request IDs should have advanced by 2.
+    try std.testing.expectEqual(initial_rid + 2, session.next_request_id);
+
+    try session.close(.generic);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
