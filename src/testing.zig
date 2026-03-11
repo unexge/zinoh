@@ -4,6 +4,7 @@
 //! readable hex-diff output on failure.
 const std = @import("std");
 const testing = std.testing;
+const log = std.log.scoped(.testing);
 
 /// Parse a hex string (e.g. "deadbeef" or "DE AD BE EF") into a byte slice.
 /// Allocates using the provided allocator — caller owns the returned memory.
@@ -107,18 +108,18 @@ pub fn assertEqualBytes(expected: []const u8, actual: []const u8) !void {
     const exp_suffix: []const u8 = if (exp.truncated) "…" else "";
     const act_suffix: []const u8 = if (act.truncated) "…" else "";
 
-    std.debug.print("\n=== Byte slice mismatch ===\n", .{});
-    std.debug.print("Expected ({d} bytes): {s}{s}\n", .{ expected.len, exp.hex, exp_suffix });
-    std.debug.print("Actual   ({d} bytes): {s}{s}\n", .{ actual.len, act.hex, act_suffix });
+    log.debug("\n=== Byte slice mismatch ===", .{});
+    log.debug("Expected ({d} bytes): {s}{s}", .{ expected.len, exp.hex, exp_suffix });
+    log.debug("Actual   ({d} bytes): {s}{s}", .{ actual.len, act.hex, act_suffix });
 
     if (m.expected_byte) |eb| {
         if (m.actual_byte) |ab| {
-            std.debug.print("First diff at byte {d}: expected 0x{x:0>2}, got 0x{x:0>2}\n", .{ m.pos, eb, ab });
+            log.debug("First diff at byte {d}: expected 0x{x:0>2}, got 0x{x:0>2}", .{ m.pos, eb, ab });
         } else {
-            std.debug.print("First diff at byte {d}: expected 0x{x:0>2}, got end-of-slice\n", .{ m.pos, eb });
+            log.debug("First diff at byte {d}: expected 0x{x:0>2}, got end-of-slice", .{ m.pos, eb });
         }
     } else if (m.actual_byte) |ab| {
-        std.debug.print("First diff at byte {d}: expected end-of-slice, got 0x{x:0>2}\n", .{ m.pos, ab });
+        log.debug("First diff at byte {d}: expected end-of-slice, got 0x{x:0>2}", .{ m.pos, ab });
     }
 
     return error.TestExpectedEqual;
