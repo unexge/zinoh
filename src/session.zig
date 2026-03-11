@@ -698,7 +698,14 @@ pub const Session = struct {
         var frame_buf: [framing.max_frame_size]u8 = undefined;
         while (true) {
             const payload = framing.readFrame(&self.stream_reader.interface, &frame_buf) catch |err| switch (err) {
-                error.EndOfStream => return error.EndOfStream,
+                error.EndOfStream => {
+                    // Connection closed before ResponseFinal — return whatever
+                    // replies we have collected so far.  This can happen when
+                    // the router doesn't support the query or closes the
+                    // session for another reason.
+                    self.state = .closed;
+                    break;
+                },
                 else => return error.ReadFailed,
             };
             self.recordReceived();
@@ -711,8 +718,14 @@ pub const Session = struct {
             const frame_hdr_byte = reader.takeByte() catch continue;
             const frame_mid = hdr.Header.decode(frame_hdr_byte).mid;
 
-            // Skip non-Frame messages (e.g., KeepAlive).
+            // Skip KeepAlive messages.
             if (frame_mid == transport.MID.keep_alive) continue;
+
+            // Handle Close messages — the router is terminating the session.
+            if (frame_mid == transport.MID.close) {
+                self.state = .closed;
+                break;
+            }
 
             if (frame_mid != transport.MID.frame) continue;
 

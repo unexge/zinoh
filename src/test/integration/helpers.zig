@@ -2,6 +2,10 @@
 //!
 //! Manages a `zenoh-test` Docker container running `eclipse/zenoh:latest`,
 //! providing start, wait-for-ready, and stop operations.
+//!
+//! The container is started once and reused across all tests in the suite.
+//! A reference count tracks active users; the container is torn down when
+//! the last user calls `releaseZenohd()`.
 const std = @import("std");
 const process = std.process;
 const net = std.Io.net;
@@ -22,23 +26,78 @@ pub const DockerError = error{
     ReadyTimeout,
 };
 
+/// Module-level state: tracks whether the Docker container has been started
+/// and how many tests are currently using it.
+var container_started: bool = false;
+var container_ref_count: usize = 0;
+/// Tracks whether Docker was detected as unavailable so we only warn once.
+var docker_unavailable: bool = false;
+
+/// Acquires a reference to the zenohd Docker container.
+///
+/// On the first call, starts the container and waits for it to become ready.
+/// On subsequent calls, simply increments the reference count.
+///
+/// Returns `true` if the container is available, `false` if Docker is not
+/// available (tests should skip in that case).
+pub fn acquireZenohd(allocator: std.mem.Allocator, io: Io) DockerError!bool {
+    if (docker_unavailable) return false;
+
+    if (!container_started) {
+        startZenohd(allocator, io) catch |err| {
+            switch (err) {
+                error.DockerNotAvailable => {
+                    docker_unavailable = true;
+                    std.log.warn(
+                        \\
+                        \\==========================================================
+                        \\  SKIPPED: Docker is not available.
+                        \\  Install Docker and ensure the daemon is running to
+                        \\  execute integration tests.
+                        \\==========================================================
+                        \\
+                    , .{});
+                    return false;
+                },
+                else => return err,
+            }
+        };
+        waitForReady(io) catch |err| {
+            // If we can't become ready, force-remove the container.
+            forceRemove(allocator, io);
+            return err;
+        };
+        container_started = true;
+    }
+
+    container_ref_count += 1;
+    return true;
+}
+
+/// Releases a reference to the zenohd Docker container.
+///
+/// When the last reference is released, the container is force-removed
+/// (instant teardown, no 10-second SIGTERM grace period).
+pub fn releaseZenohd(allocator: std.mem.Allocator, io: Io) void {
+    if (container_ref_count == 0) return;
+    container_ref_count -= 1;
+
+    if (container_ref_count == 0 and container_started) {
+        forceRemove(allocator, io);
+        container_started = false;
+    }
+}
+
 /// Starts the zenohd Docker container in detached mode.
 ///
 /// Runs: `docker run --name zenoh-test --rm -d -p 7447:7447 eclipse/zenoh:latest`
 ///
 /// If Docker is not available or the container fails to start, returns an error
 /// with a descriptive log message.
-pub fn startZenohd(allocator: std.mem.Allocator, io: Io) DockerError!void {
+fn startZenohd(allocator: std.mem.Allocator, io: Io) DockerError!void {
     // First, ensure any leftover container from a previous run is removed.
     // This is best-effort — we ignore errors (container might not exist).
-    if (process.run(allocator, io, .{
-        .argv = &.{ "docker", "rm", "-f", container_name },
-        .stderr_limit = Io.Limit.limited(4096),
-        .stdout_limit = Io.Limit.limited(4096),
-    })) |cleanup_result| {
-        allocator.free(cleanup_result.stdout);
-        allocator.free(cleanup_result.stderr);
-    } else |_| {}
+    forceRemove(allocator, io);
 
     const result = process.run(allocator, io, .{
         .argv = &.{
@@ -76,7 +135,7 @@ pub fn startZenohd(allocator: std.mem.Allocator, io: Io) DockerError!void {
 ///
 /// Retries every 250ms for up to 30 seconds. Returns `ReadyTimeout` if
 /// zenohd does not become reachable within the timeout period.
-pub fn waitForReady(io: Io) DockerError!void {
+fn waitForReady(io: Io) DockerError!void {
     const max_attempts: usize = @intCast(@divTrunc(ready_timeout_s * 1000, poll_interval_ms));
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(zenoh_port) };
 
@@ -95,34 +154,31 @@ pub fn waitForReady(io: Io) DockerError!void {
     return DockerError.ReadyTimeout;
 }
 
-/// Stops the zenohd Docker container.
+/// Force-remove the Docker container (instant, no grace period).
 ///
-/// Runs: `docker stop zenoh-test`
+/// Uses `docker rm -f` which sends SIGKILL immediately, avoiding the
+/// 10-second SIGTERM grace period of `docker stop`.
 ///
-/// Idempotent — ignores errors if the container is already stopped or doesn't exist.
-pub fn stopZenohd(allocator: std.mem.Allocator, io: Io) void {
+/// Idempotent — ignores errors if the container doesn't exist.
+fn forceRemove(allocator: std.mem.Allocator, io: Io) void {
     const result = process.run(allocator, io, .{
-        .argv = &.{ "docker", "stop", container_name },
+        .argv = &.{ "docker", "rm", "-f", container_name },
         .stderr_limit = Io.Limit.limited(4096),
         .stdout_limit = Io.Limit.limited(4096),
     }) catch {
-        std.log.warn("Failed to run 'docker stop {s}' (container may already be stopped)", .{container_name});
+        std.log.warn("Failed to run 'docker rm -f {s}' (container may already be removed)", .{container_name});
         return;
     };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| {
             if (code == 0) {
-                std.log.info("zenohd container '{s}' stopped successfully", .{container_name});
-            } else {
-                std.log.warn("docker stop exited with code {d} (container may already be stopped)", .{code});
+                std.log.info("zenohd container '{s}' removed successfully", .{container_name});
             }
         },
-        else => {
-            std.log.warn("docker stop terminated abnormally (container may already be stopped)", .{});
-        },
+        else => {},
     }
 }
 
