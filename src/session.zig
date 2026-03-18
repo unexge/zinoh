@@ -30,6 +30,9 @@ const Push = network.Push;
 const Request = network.Request;
 const Response = network.Response;
 const ResponseFinal = network.ResponseFinal;
+const Interest = network.Interest;
+const Declare = network.Declare;
+const DeclareFinal = network.DeclareFinal;
 
 const zenoh_msgs = @import("zenoh/messages.zig");
 const ZPut = zenoh_msgs.Put;
@@ -244,6 +247,7 @@ pub const Session = struct {
         };
 
         try session.performHandshake();
+        try session.performInterestDeclare();
 
         return session;
     }
@@ -321,6 +325,126 @@ pub const Session = struct {
         self.recordReceived();
 
         self.state = .open;
+    }
+
+    /// Perform the Interest/Declare exchange after handshake.
+    ///
+    /// After the 4-message handshake, the router sends an Interest asking
+    /// the client to declare its resources. We respond with a single
+    /// Declare(DeclareFinal) — "I have nothing to declare" — and then
+    /// drain the router's own declarations until we see its DeclareFinal.
+    ///
+    /// This exchange must complete before the router will route any data
+    /// (Push/Request) for this session.
+    ///
+    /// If the router does not send an Interest (e.g., older routers at
+    /// patch level ≤ 1), the method returns successfully without performing
+    /// the exchange. In this case, data routing may still work depending
+    /// on the router version.
+    fn performInterestDeclare(self: *Session) OpenError!void {
+        var frame_buf: [framing.max_frame_size]u8 = undefined;
+        var interest_responded = false;
+
+        while (true) {
+            const payload = self.recvFrame(&frame_buf) catch |err| switch (err) {
+                error.EndOfStream => {
+                    // Connection closed before we could complete the exchange.
+                    // If we haven't seen Interest, the exchange may not be
+                    // needed. Return OK so the caller can proceed.
+                    if (!interest_responded) return;
+                    // If we responded to Interest but didn't see DeclareFinal,
+                    // the session may be in an inconsistent state.
+                    self.state = .closed;
+                    return error.EndOfStream;
+                },
+                else => return @as(OpenError, err),
+            };
+            self.recordReceived();
+
+            if (payload.len == 0) continue;
+
+            var reader: Io.Reader = .fixed(payload);
+
+            // Parse the transport header.
+            const transport_hdr_byte = reader.takeByte() catch continue;
+            const transport_mid = hdr.Header.decode(transport_hdr_byte).mid;
+
+            // KeepAlive — if we haven't seen Interest yet, the router is
+            // not going to send one (Interest would arrive before KeepAlive
+            // in the protocol flow). Skip the exchange.
+            if (transport_mid == transport.MID.keep_alive) {
+                if (!interest_responded) return;
+                continue;
+            }
+
+            // Close — the router is terminating the session.
+            if (transport_mid == transport.MID.close) {
+                self.state = .closed;
+                return error.UnexpectedMessage;
+            }
+
+            // Only process Frame messages from here.
+            if (transport_mid != transport.MID.frame) continue;
+
+            // Decode Frame header (consume SN).
+            _ = Frame.decodeHeader(transport_hdr_byte, &reader) catch continue;
+
+            // Parse the network message header.
+            const net_hdr_byte = reader.takeByte() catch continue;
+            const net_mid = hdr.Header.decode(net_hdr_byte).mid;
+
+            if (net_mid == network.MID.interest) {
+                // Decode Interest to extract the id.
+                const interest = try Interest.decode(net_hdr_byte, &reader, self.allocator);
+                defer interest.deinit(self.allocator);
+
+                // Respond with Frame → Declare(I=1, interest_id) → DeclareFinal.
+                try self.sendDeclareResponse(interest.id);
+                interest_responded = true;
+                continue;
+            }
+
+            if (net_mid == network.MID.declare) {
+                // Parse Declare header (consume interest_id if present).
+                _ = Declare.decodeHeader(net_hdr_byte, &reader) catch continue;
+
+                // Parse the inner declaration sub-message.
+                const decl_hdr_byte = reader.takeByte() catch continue;
+                const decl_mid = hdr.Header.decode(decl_hdr_byte).mid;
+
+                if (decl_mid == network.DeclareMID.declare_final) {
+                    // Router's DeclareFinal — exchange is complete
+                    // (only if we've already responded to the Interest).
+                    if (interest_responded) break;
+                }
+                // Other declarations (DeclareSubscriber, etc.) — skip.
+                continue;
+            }
+
+            // Other network messages — skip. If we haven't seen Interest
+            // yet and we're getting unexpected messages, don't loop forever.
+            if (!interest_responded) return;
+        }
+    }
+
+    /// Send a Declare(DeclareFinal) response for the given interest_id.
+    ///
+    /// Assembles and sends: Frame(reliable, sn) → Declare(I=1, interest_id) → DeclareFinal
+    fn sendDeclareResponse(self: *Session, interest_id: u64) SendError!void {
+        var msg_buf: [512]u8 = undefined;
+        const assembled = encodeDeclareResponse(self.nextSn(), interest_id, &msg_buf) catch
+            unreachable; // 512 bytes is more than enough for this message
+
+        // Send framed (with 2-byte LE length prefix).
+        self.write_mutex.lock(self.io) catch return error.WriteFailed;
+        defer self.write_mutex.unlock(self.io);
+
+        var stream_writer = self.stream.writer(self.io, self.write_buf);
+        framing.writeFrame(assembled, &stream_writer.interface) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            error.MessageTooLarge => unreachable, // our message is well under 64KB
+        };
+        try stream_writer.interface.flush();
     }
 
     /// Decode an InitAck from raw frame bytes.
@@ -868,6 +992,28 @@ pub const Session = struct {
 
         return writer.buffered();
     }
+
+    /// Encode a Declare(DeclareFinal) response into a buffer (without TCP framing).
+    /// Returns the assembled Frame → Declare(I=1, interest_id) → DeclareFinal bytes.
+    /// This is exposed for unit testing of wire format.
+    pub fn encodeDeclareResponse(
+        sn: u64,
+        interest_id: u64,
+        buf: []u8,
+    ) Io.Writer.Error![]const u8 {
+        var writer: Io.Writer = .fixed(buf);
+
+        const frame = Frame{ .reliable = true, .seq_num = sn };
+        try frame.encodeHeader(&writer);
+
+        const declare = Declare{ .interest_id = interest_id };
+        try declare.encodeHeader(&writer);
+
+        const declare_final = DeclareFinal{};
+        try declare_final.encode(&writer);
+
+        return writer.buffered();
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1286,6 +1432,47 @@ test "z_get: Frame is always reliable" {
     const h = hdr.Header.decode(encoded[0]);
     try testing.expectEqual(@as(u5, transport.MID.frame), h.mid);
     try testing.expect(h.flag0()); // R flag
+}
+
+// ---------------------------------------------------------------------------
+// Declare response wire-bytes unit tests
+// ---------------------------------------------------------------------------
+
+test "declare_response: wire bytes for interest_id=1, sn=0" {
+    var buf: [256]u8 = undefined;
+    const encoded = try Session.encodeDeclareResponse(0, 1, &buf);
+
+    // Frame: header=0x25 (reliable, MID=0x05, R=1), sn=VLE(0) = 0x00
+    try testing.expectEqual(@as(u8, 0x25), encoded[0]); // Frame header
+    try testing.expectEqual(@as(u8, 0x00), encoded[1]); // sn=0
+
+    // Declare: header=0x3E (MID=0x1E | I=0x20), interest_id=VLE(1) = 0x01
+    try testing.expectEqual(@as(u8, 0x3E), encoded[2]); // Declare header with I flag
+    try testing.expectEqual(@as(u8, 0x01), encoded[3]); // interest_id=1
+
+    // DeclareFinal: header=0x1A (sub-MID=0x1A, no flags)
+    try testing.expectEqual(@as(u8, 0x1A), encoded[4]); // DeclareFinal header
+
+    try testing.expectEqual(@as(usize, 5), encoded.len);
+}
+
+test "declare_response: interest_id > 127 uses multi-byte VLE" {
+    var buf: [256]u8 = undefined;
+    const encoded = try Session.encodeDeclareResponse(0, 200, &buf);
+
+    // Frame: 0x25, 0x00
+    try testing.expectEqual(@as(u8, 0x25), encoded[0]);
+    try testing.expectEqual(@as(u8, 0x00), encoded[1]);
+
+    // Declare: 0x3E, VLE(200) = 0xC8 0x01
+    try testing.expectEqual(@as(u8, 0x3E), encoded[2]);
+    try testing.expectEqual(@as(u8, 0xC8), encoded[3]);
+    try testing.expectEqual(@as(u8, 0x01), encoded[4]);
+
+    // DeclareFinal: 0x1A
+    try testing.expectEqual(@as(u8, 0x1A), encoded[5]);
+
+    try testing.expectEqual(@as(usize, 6), encoded.len);
 }
 
 // ---------------------------------------------------------------------------
