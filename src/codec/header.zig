@@ -86,6 +86,7 @@ pub const TransportMid = struct {
 
 /// Network-layer message IDs (MID values for bits 0–4).
 pub const NetworkMid = struct {
+    pub const interest: u5 = 0x19;
     pub const response_final: u5 = 0x1A;
     pub const response: u5 = 0x1B;
     pub const request: u5 = 0x1C;
@@ -262,6 +263,7 @@ test "Header: MID masking — transport message IDs" {
 
 test "Header: MID masking — network message IDs" {
     const mids = [_]u5{
+        NetworkMid.interest,
         NetworkMid.response_final,
         NetworkMid.response,
         NetworkMid.request,
@@ -302,6 +304,7 @@ test "TransportMid: constant values match spec" {
 }
 
 test "NetworkMid: constant values match spec" {
+    try testing.expectEqual(@as(u5, 0x19), NetworkMid.interest);
     try testing.expectEqual(@as(u5, 0x1A), NetworkMid.response_final);
     try testing.expectEqual(@as(u5, 0x1B), NetworkMid.response);
     try testing.expectEqual(@as(u5, 0x1C), NetworkMid.request);

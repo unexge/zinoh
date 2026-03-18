@@ -361,6 +361,109 @@ pub const ResponseFinal = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Interest (MID = 0x19)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Interest message: expresses interest in certain kinds of declarations.
+///
+/// Wire format (§8.6):
+///   header: |Z|F|C| 0x19 |
+///   id: VLE (z32) — interest identifier
+///   -- if not final (C or F is set) --
+///   flags: u8 — interest flags byte: |A|M|N|R|T|Q|S|K|
+///   if R=1: key_scope (VLE z16)
+///   if R=1 && N=1: key_suffix (VLE-length + UTF-8 string)
+///   if Z=1: extensions
+///
+/// **Header Flags:**
+/// - C (bit 5, 0x20): Interest in current declarations
+/// - F (bit 6, 0x40): Interest in future declarations
+/// - Z (bit 7, 0x80): Extensions present
+/// - If C=0 and F=0: Final interest (undeclare); no flags byte follows
+pub const Interest = struct {
+    /// Interest identifier.
+    id: u64,
+    /// C flag: interest in current declarations.
+    current: bool = false,
+    /// F flag: interest in future declarations.
+    future: bool = false,
+    /// Interest flags byte (only present when C or F is set).
+    /// Bits: |A|M|N|R|T|Q|S|K|
+    interest_flags: ?u8 = null,
+    /// Key expression numeric ID (only present when R=1 in interest_flags).
+    key_scope: ?u64 = null,
+    /// Key expression suffix (only present when R=1 && N=1 in interest_flags).
+    key_suffix: ?[]const u8 = null,
+
+    /// Free allocator-owned memory from a decoded Interest.
+    pub fn deinit(self: *const Interest, allocator: Allocator) void {
+        if (self.key_suffix) |s| allocator.free(@constCast(s));
+    }
+
+    /// Returns true if this is a final interest (C=0, F=0).
+    pub fn isFinal(self: *const Interest) bool {
+        return !self.current and !self.future;
+    }
+
+    /// Interest flags bit positions.
+    pub const Flags = struct {
+        pub const key_exprs: u8 = 0x01; // K: bit 0
+        pub const subscribers: u8 = 0x02; // S: bit 1
+        pub const queryables: u8 = 0x04; // Q: bit 2
+        pub const tokens: u8 = 0x08; // T: bit 3
+        pub const restricted: u8 = 0x10; // R: bit 4
+        pub const has_suffix: u8 = 0x20; // N: bit 5
+        pub const mapping: u8 = 0x40; // M: bit 6
+        pub const aggregate: u8 = 0x80; // A: bit 7
+    };
+
+    /// Decode an Interest message from the reader. The header byte has already
+    /// been read to determine this is an Interest (MID=0x19).
+    pub fn decode(header: u8, reader: *Io.Reader, allocator: Allocator) DecodeAllocError!Interest {
+        const c_flag = (header & Flag.bit5) != 0; // C: bit 5
+        const f_flag = (header & Flag.bit6) != 0; // F: bit 6
+        const z_flag = (header & Flag.z_flag) != 0; // Z: bit 7
+
+        const id = try vle.decode(reader);
+
+        var interest_flags: ?u8 = null;
+        var key_scope: ?u64 = null;
+        var key_suffix: ?[]u8 = null;
+
+        // If C or F is set, this is not a final interest — flags byte follows
+        if (c_flag or f_flag) {
+            interest_flags = try reader.takeByte();
+            const flags = interest_flags.?;
+
+            // If R=1 (restricted), decode key_scope
+            if ((flags & Flags.restricted) != 0) {
+                key_scope = try vle.decode(reader);
+
+                // If R=1 && N=1, decode key_suffix
+                if ((flags & Flags.has_suffix) != 0) {
+                    key_suffix = try primitives.readString(reader, allocator);
+                }
+            }
+        }
+
+        errdefer if (key_suffix) |s| allocator.free(s);
+
+        if (z_flag) {
+            try skipExtensions(reader);
+        }
+
+        return Interest{
+            .id = id,
+            .current = c_flag,
+            .future = f_flag,
+            .interest_flags = interest_flags,
+            .key_scope = key_scope,
+            .key_suffix = key_suffix,
+        };
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1292,6 +1395,225 @@ test "full query sequence: Request → Response → ResponseFinal wire vectors" 
     try testing.expectEqual(@as(u64, 1), d1.request_id);
     try testing.expectEqual(@as(u64, 1), d2.request_id);
     try testing.expectEqual(@as(u64, 1), d3.request_id);
+}
+
+// ---------------------------------------------------------------------------
+// Interest tests
+// ---------------------------------------------------------------------------
+
+test "Interest: decode typical router interest (C=1, F=1, flags=0xFF)" {
+    // Header: 0x79 = MID(0x19) | C(0x20) | F(0x40)
+    // id: VLE(1) = 0x01
+    // interest_flags: 0xFF (all flags set: K,S,Q,T,R,N,M,A)
+    // key_scope: VLE(0) = 0x00 (R=1 so key_scope present)
+    // key_suffix: VLE(4) + "test" (R=1 && N=1 so suffix present)
+    const wire = [_]u8{ 0x79, 0x01, 0xFF, 0x00, 0x04 } ++ "test".*;
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.interest), hdr.Header.decode(header).mid);
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 1), decoded.id);
+    try testing.expect(decoded.current);
+    try testing.expect(decoded.future);
+    try testing.expectEqual(@as(u8, 0xFF), decoded.interest_flags.?);
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope.?);
+    try testing.expectEqualStrings("test", decoded.key_suffix.?);
+    try testing.expect(!decoded.isFinal());
+}
+
+test "Interest: decode final interest (C=0, F=0)" {
+    // Header: 0x19 = MID(0x19), no C, no F, no Z
+    // id: VLE(5) = 0x05
+    // No flags byte (final interest)
+    const wire = [_]u8{ 0x19, 0x05 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.interest), hdr.Header.decode(header).mid);
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 5), decoded.id);
+    try testing.expect(!decoded.current);
+    try testing.expect(!decoded.future);
+    try testing.expectEqual(@as(?u8, null), decoded.interest_flags);
+    try testing.expectEqual(@as(?u64, null), decoded.key_scope);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
+    try testing.expect(decoded.isFinal());
+}
+
+test "Interest: decode with C=1 only, flags=0x0F (K,S,Q,T but no R)" {
+    // Header: 0x39 = MID(0x19) | C(0x20)
+    // id: VLE(3) = 0x03
+    // interest_flags: 0x0F (K=1, S=1, Q=1, T=1, R=0)
+    // No key_scope or suffix (R=0)
+    const wire = [_]u8{ 0x39, 0x03, 0x0F };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 3), decoded.id);
+    try testing.expect(decoded.current);
+    try testing.expect(!decoded.future);
+    try testing.expectEqual(@as(u8, 0x0F), decoded.interest_flags.?);
+    try testing.expectEqual(@as(?u64, null), decoded.key_scope);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
+    try testing.expect(!decoded.isFinal());
+}
+
+test "Interest: decode with F=1 only, flags=0x0F" {
+    // Header: 0x59 = MID(0x19) | F(0x40)
+    // id: VLE(7) = 0x07
+    // interest_flags: 0x0F
+    const wire = [_]u8{ 0x59, 0x07, 0x0F };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 7), decoded.id);
+    try testing.expect(!decoded.current);
+    try testing.expect(decoded.future);
+    try testing.expectEqual(@as(u8, 0x0F), decoded.interest_flags.?);
+    try testing.expectEqual(@as(?u64, null), decoded.key_scope);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
+    try testing.expect(!decoded.isFinal());
+}
+
+test "Interest: decode with R=1 but N=0 (key_scope only, no suffix)" {
+    // Header: 0x79 = MID(0x19) | C(0x20) | F(0x40)
+    // id: VLE(2) = 0x02
+    // interest_flags: 0x10 (R=1 only)
+    // key_scope: VLE(42) = 0x2A
+    // No suffix (N=0)
+    const wire = [_]u8{ 0x79, 0x02, 0x10, 0x2A };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 2), decoded.id);
+    try testing.expect(decoded.current);
+    try testing.expect(decoded.future);
+    try testing.expectEqual(@as(u8, 0x10), decoded.interest_flags.?);
+    try testing.expectEqual(@as(u64, 42), decoded.key_scope.?);
+    try testing.expectEqual(@as(?[]const u8, null), decoded.key_suffix);
+}
+
+test "Interest: decode with extensions (Z=1)" {
+    // Header: 0xF9 = MID(0x19) | C(0x20) | F(0x40) | Z(0x80)
+    // id: VLE(1) = 0x01
+    // interest_flags: 0x0F (no R, so no key_scope/suffix)
+    // Extension: Unit ext header=0x01 (ENC=Unit, ID=0x01, Z=0), no body
+    const wire = [_]u8{ 0xF9, 0x01, 0x0F, 0x01 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 1), decoded.id);
+    try testing.expect(decoded.current);
+    try testing.expect(decoded.future);
+    try testing.expectEqual(@as(u8, 0x0F), decoded.interest_flags.?);
+}
+
+test "Interest: decode final interest with extensions (Z=1, C=0, F=0)" {
+    // Header: 0x99 = MID(0x19) | Z(0x80)
+    // id: VLE(10) = 0x0A
+    // No flags byte (final)
+    // Extension: ZInt ext header=0x21 (ENC=ZInt, ID=0x01, Z=0), body=VLE(0x05)
+    const wire = [_]u8{ 0x99, 0x0A, 0x21, 0x05 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 10), decoded.id);
+    try testing.expect(decoded.isFinal());
+    try testing.expectEqual(@as(?u8, null), decoded.interest_flags);
+}
+
+test "Interest: decode with large id (multi-byte VLE)" {
+    // Header: 0x19 = MID(0x19), final
+    // id: VLE(200) = 0xC8 0x01
+    const wire = [_]u8{ 0x19, 0xC8, 0x01 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 200), decoded.id);
+    try testing.expect(decoded.isFinal());
+}
+
+test "Interest: wire vector — typical router interest C=1,F=1,flags=0x0F no key" {
+    // Router sends: Interest(id=1, C=1, F=1, flags=0x0F)
+    // No R flag, so no key_scope/suffix
+    // Header: 0x79 = MID(0x19) | C(0x20) | F(0x40)
+    // id: 0x01
+    // flags: 0x0F
+    const wire = [_]u8{ 0x79, 0x01, 0x0F };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.interest), hdr.Header.decode(header).mid);
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 1), decoded.id);
+    try testing.expect(decoded.current);
+    try testing.expect(decoded.future);
+    try testing.expectEqual(@as(u8, 0x0F), decoded.interest_flags.?);
+}
+
+test "Interest: MID is interest" {
+    // Just verify a header byte with MID=0x19 is parsed correctly
+    const h = hdr.Header.decode(0x79);
+    try testing.expectEqual(@as(u5, MID.interest), h.mid);
+    try testing.expect(h.flag0()); // C
+    try testing.expect(h.flag1()); // F
+    try testing.expect(!h.flag2()); // no Z
+}
+
+test "Interest: decode with R=1 and N=1, key_suffix present" {
+    // Header: 0x39 = MID(0x19) | C(0x20)
+    // id: VLE(4) = 0x04
+    // interest_flags: 0x31 (K=1, R=1, N=1)
+    // key_scope: VLE(0) = 0x00
+    // key_suffix: VLE(12) + "demo/test/**"
+    const wire = [_]u8{ 0x39, 0x04, 0x31, 0x00, 0x0C } ++ "demo/test/**".*;
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+
+    const decoded = try Interest.decode(header, &reader, testing.allocator);
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 4), decoded.id);
+    try testing.expect(decoded.current);
+    try testing.expect(!decoded.future);
+    try testing.expectEqual(@as(u8, 0x31), decoded.interest_flags.?);
+    try testing.expectEqual(@as(u64, 0), decoded.key_scope.?);
+    try testing.expectEqualStrings("demo/test/**", decoded.key_suffix.?);
 }
 
 test {
