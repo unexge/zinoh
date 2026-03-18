@@ -588,20 +588,17 @@ test "z_get: put then get round-trip" {
         const result = try session.get("demo/test/roundtrip", .{});
         defer result.deinit(allocator);
 
-        // If the router supports in-memory storage we should get at least
-        // one reply with the value we put.  If the router has no storage
-        // backend (vanilla zenohd without plugins), it may close the
-        // connection or return zero replies.
-        if (result.replies.len >= 1) {
-            var found = false;
-            for (result.replies) |reply| {
-                if (std.mem.eql(u8, reply.payload, "Hello Zinoh!")) {
-                    found = true;
-                    break;
-                }
+        // With in-memory storage enabled, we should always get at least one reply.
+        try std.testing.expect(result.replies.len >= 1);
+
+        var found = false;
+        for (result.replies) |reply| {
+            if (std.mem.eql(u8, reply.payload, "Hello Zinoh!")) {
+                found = true;
+                break;
             }
-            try std.testing.expect(found);
         }
+        try std.testing.expect(found);
 
         if (session.state == .open) {
             try session.close(.generic);
@@ -642,6 +639,74 @@ test "z_get: request_id is properly incremented" {
 
     if (session.state == .open) {
         try session.close(.generic);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage-backed put/get integration tests
+// ---------------------------------------------------------------------------
+
+test "z_put: multiple puts to different keys" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!try acquireOrSkip(allocator, io)) return;
+    defer helpers.releaseZenohd(allocator, io);
+
+    const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
+
+    const keys = [_][]const u8{
+        "demo/test/multi/alpha",
+        "demo/test/multi/beta",
+        "demo/test/multi/gamma",
+    };
+    const values = [_][]const u8{
+        "value-alpha",
+        "value-beta",
+        "value-gamma",
+    };
+
+    // Put to all 3 keys in one session.
+    {
+        const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0x71, 0x72, 0x73 });
+        var session = try zinoh.session.Session.open(allocator, io, address, zid);
+        defer session.deinit();
+
+        for (keys, values) |key, value| {
+            try session.put(key, value, .{});
+        }
+
+        try session.close(.generic);
+    }
+
+    // Brief pause for storage processing.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+
+    // Get each key back in a new session and verify.
+    {
+        const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0x74, 0x75, 0x76 });
+        var session = try zinoh.session.Session.open(allocator, io, address, zid);
+        defer session.deinit();
+
+        for (keys, values) |key, expected_value| {
+            const result = try session.get(key, .{});
+            defer result.deinit(allocator);
+
+            try std.testing.expect(result.replies.len >= 1);
+
+            var found = false;
+            for (result.replies) |reply| {
+                if (std.mem.eql(u8, reply.payload, expected_value)) {
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+        }
+
+        if (session.state == .open) {
+            try session.close(.generic);
+        }
     }
 }
 

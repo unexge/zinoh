@@ -107,6 +107,7 @@ fn startZenohd(allocator: std.mem.Allocator, io: Io) DockerError!void {
             "-d",
             "-p", "7447:7447",
             docker_image,
+            "--cfg=plugins/storage_manager/storages/demo:{key_expr:\"demo/**\",volume:{id:\"memory\"}}",
         },
         .stderr_limit = Io.Limit.limited(4096),
         .stdout_limit = Io.Limit.limited(4096),
