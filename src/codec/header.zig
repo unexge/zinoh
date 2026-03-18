@@ -94,6 +94,13 @@ pub const NetworkMid = struct {
     pub const declare: u5 = 0x1E;
 };
 
+/// Declaration sub-message IDs (MID values for bits 0–4).
+/// These appear inside a Declare network message and are disambiguated
+/// by protocol layer context (they may overlap with network MIDs numerically).
+pub const DeclareMid = struct {
+    pub const declare_final: u5 = 0x1A;
+};
+
 /// Zenoh-layer message IDs (MID values for bits 0–4).
 /// Note: these overlap with transport MIDs numerically;
 /// disambiguation is by protocol layer context.
@@ -318,6 +325,10 @@ test "ZenohMid: constant values match spec" {
     try testing.expectEqual(@as(u5, 0x03), ZenohMid.query);
     try testing.expectEqual(@as(u5, 0x04), ZenohMid.reply);
     try testing.expectEqual(@as(u5, 0x05), ZenohMid.err);
+}
+
+test "DeclareMid: constant values match spec" {
+    try testing.expectEqual(@as(u5, 0x1A), DeclareMid.declare_final);
 }
 
 // ---------------------------------------------------------------------------

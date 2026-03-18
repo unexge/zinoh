@@ -464,6 +464,103 @@ pub const Interest = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Declare (MID = 0x1E)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Declare message: carries declaration sub-messages (e.g., DeclareFinal).
+///
+/// Wire format (§8.5):
+///   header: |Z|X|I| 0x1E |
+///   if I=1: interest_id (VLE z32) — responding to an Interest
+///   Declaration: inner declaration sub-message (e.g., DeclareFinal)
+///
+/// **Header Flags:**
+/// - I (bit 5, 0x20): Interest response — interest_id follows
+/// - X (bit 6, 0x40): Reserved
+/// - Z (bit 7, 0x80): Extensions present
+///
+/// This struct encodes/decodes only the Declare header (MID + interest_id).
+/// The inner declaration sub-message must be encoded/decoded separately.
+pub const Declare = struct {
+    /// Interest ID this declare is responding to (set when I flag is true).
+    interest_id: ?u64 = null,
+
+    /// Encode the Declare header to the writer.
+    /// The caller must encode the inner declaration sub-message immediately after.
+    pub fn encodeHeader(self: *const Declare, writer: *Io.Writer) Io.Writer.Error!void {
+        // Header: |Z|X|I| MID=0x1E |
+        var header: u8 = @as(u8, MID.declare);
+        if (self.interest_id != null) header |= Flag.bit5; // I flag
+        try writer.writeByte(header);
+
+        // Interest ID (VLE) if I=1
+        if (self.interest_id) |id| {
+            try vle.encode(id, writer);
+        }
+    }
+
+    /// Decode a Declare header from the reader. The header byte has already been
+    /// parsed to determine this is a Declare (MID=0x1E).
+    /// Returns the Declare with fields populated. The remaining bytes are the
+    /// inner declaration sub-message, which the caller should decode separately.
+    pub fn decodeHeader(header: u8, reader: *Io.Reader) DecodeError!Declare {
+        const i_flag = (header & Flag.bit5) != 0; // I: bit 5
+        const z_flag = (header & Flag.z_flag) != 0; // Z: bit 7
+
+        var interest_id: ?u64 = null;
+        if (i_flag) {
+            interest_id = try vle.decode(reader);
+        }
+
+        if (z_flag) {
+            try skipExtensions(reader);
+        }
+
+        return Declare{
+            .interest_id = interest_id,
+        };
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DeclareFinal (declaration sub-message, sub-MID = 0x1A)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Declaration sub-message IDs.
+pub const DeclareMID = hdr.DeclareMid;
+
+/// DeclareFinal: a declaration sub-message signaling "I have no more declarations."
+///
+/// Wire format (§10):
+///   header: |Z|X|X| 0x1A |
+///
+/// This is a single-byte sub-message with no additional fields.
+/// When Z=1, extensions follow (skipped on decode).
+pub const DeclareFinal = struct {
+    /// Encode this DeclareFinal to the writer.
+    /// Writes a single byte: 0x1A (sub-MID with no flags).
+    pub fn encode(_: *const DeclareFinal, writer: *Io.Writer) Io.Writer.Error!void {
+        try writer.writeByte(@as(u8, DeclareMID.declare_final));
+    }
+
+    /// Decode a DeclareFinal from the reader. The header byte has already been
+    /// read. Validates the sub-MID and skips extensions if Z=1.
+    pub fn decode(header: u8, reader: *Io.Reader) (DecodeError || error{Unexpected})!DeclareFinal {
+        const parsed = hdr.Header.decode(header);
+        if (parsed.mid != DeclareMID.declare_final) {
+            return error.Unexpected;
+        }
+
+        // Z flag: extensions present
+        if (parsed.hasExtensions()) {
+            try skipExtensions(reader);
+        }
+
+        return DeclareFinal{};
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1614,6 +1711,275 @@ test "Interest: decode with R=1 and N=1, key_suffix present" {
     try testing.expectEqual(@as(u8, 0x31), decoded.interest_flags.?);
     try testing.expectEqual(@as(u64, 0), decoded.key_scope.?);
     try testing.expectEqualStrings("demo/test/**", decoded.key_suffix.?);
+}
+
+// ---------------------------------------------------------------------------
+// Declare header tests
+// ---------------------------------------------------------------------------
+
+fn encodeDeclareHeaderHelper(msg: *const Declare, buf: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buf);
+    msg.encodeHeader(&writer) catch unreachable;
+    return writer.buffered();
+}
+
+test "Declare: encodeHeader with I=1, interest_id=1" {
+    const msg = Declare{ .interest_id = 1 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+
+    // Header: 0x3E (MID=0x1E | I=0x20)
+    // interest_id: VLE(1) = 0x01
+    try assertEqualBytes(&.{ 0x3E, 0x01 }, encoded);
+}
+
+test "Declare: encodeHeader with I=0 (no interest_id)" {
+    const msg = Declare{};
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+
+    // Header: 0x1E (MID=0x1E, no flags)
+    try assertEqualBytes(&.{0x1E}, encoded);
+}
+
+test "Declare: MID is declare" {
+    const msg = Declare{ .interest_id = 1 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+    try testing.expectEqual(@as(u5, MID.declare), hdr.Header.decode(encoded[0]).mid);
+}
+
+test "Declare: I flag set when interest_id present" {
+    const msg = Declare{ .interest_id = 5 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(h.flag0()); // I flag (bit 5)
+}
+
+test "Declare: I flag clear when no interest_id" {
+    const msg = Declare{};
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(!h.flag0()); // I flag not set
+}
+
+test "Declare: no Z flag set (extensions not supported for encode)" {
+    const msg = Declare{ .interest_id = 1 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+    const h = hdr.Header.decode(encoded[0]);
+    try testing.expect(!h.flag2()); // Z flag not set
+}
+
+test "Declare: wire compatibility — header 0x3E matches spec (I=1)" {
+    const msg = Declare{ .interest_id = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+    // 0x3E = MID(0x1E) | I(0x20)
+    try testing.expectEqual(@as(u8, 0x3E), encoded[0]);
+}
+
+test "Declare: interest_id > 127 uses multi-byte VLE" {
+    const msg = Declare{ .interest_id = 200 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+
+    // Header: 0x3E (MID=0x1E | I=0x20)
+    // interest_id: VLE(200) = 0xC8 0x01
+    try assertEqualBytes(&.{ 0x3E, 0xC8, 0x01 }, encoded);
+}
+
+test "Declare: round-trip with I=1, interest_id=1" {
+    const original = Declare{ .interest_id = 1 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.declare), hdr.Header.decode(header).mid);
+    const decoded = try Declare.decodeHeader(header, &reader);
+
+    try testing.expectEqual(original.interest_id, decoded.interest_id);
+}
+
+test "Declare: round-trip with I=0 (no interest_id)" {
+    const original = Declare{};
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Declare.decodeHeader(header, &reader);
+
+    try testing.expectEqual(@as(?u64, null), decoded.interest_id);
+}
+
+test "Declare: round-trip with large interest_id" {
+    const original = Declare{ .interest_id = 0xFFFFFFFF };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try Declare.decodeHeader(header, &reader);
+
+    try testing.expectEqual(original.interest_id, decoded.interest_id);
+}
+
+test "Declare: decode with extensions (Z=1)" {
+    // Header: 0xBE = MID(0x1E) | I(0x20) | Z(0x80)
+    // interest_id: VLE(1) = 0x01
+    // Extension: Unit ext header=0x01 (ENC=Unit, ID=0x01, Z=0), no body
+    const wire = [_]u8{ 0xBE, 0x01, 0x01 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.declare), hdr.Header.decode(header).mid);
+
+    const decoded = try Declare.decodeHeader(header, &reader);
+
+    try testing.expectEqual(@as(u64, 1), decoded.interest_id.?);
+}
+
+test "Declare: wire vector — I=1, interest_id=0" {
+    const msg = Declare{ .interest_id = 0 };
+    var buf: [16]u8 = undefined;
+    const encoded = encodeDeclareHeaderHelper(&msg, &buf);
+    try assertEqualBytes(&.{ 0x3E, 0x00 }, encoded);
+}
+
+// ---------------------------------------------------------------------------
+// DeclareFinal (declaration sub-message) tests
+// ---------------------------------------------------------------------------
+
+fn encodeDeclareSubFinalHelper(msg: *const DeclareFinal, buf: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buf);
+    msg.encode(&writer) catch unreachable;
+    return writer.buffered();
+}
+
+test "DeclareFinal: encode produces 0x1A" {
+    const msg = DeclareFinal{};
+    var buf: [4]u8 = undefined;
+    const encoded = encodeDeclareSubFinalHelper(&msg, &buf);
+
+    try assertEqualBytes(&.{0x1A}, encoded);
+}
+
+test "DeclareFinal: round-trip encode/decode" {
+    const original = DeclareFinal{};
+    var buf: [4]u8 = undefined;
+    const encoded = encodeDeclareSubFinalHelper(&original, &buf);
+
+    var reader: Io.Reader = .fixed(encoded);
+    const header = try reader.takeByte();
+    const decoded = try DeclareFinal.decode(header, &reader);
+    _ = decoded;
+
+    // DeclareFinal has no fields; reaching here without error means success
+}
+
+test "DeclareFinal: decode validates sub-MID" {
+    // Pass an invalid header byte (not 0x1A)
+    const wire = [_]u8{0x01}; // Wrong MID
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    const result = DeclareFinal.decode(header, &reader);
+    try testing.expectError(error.Unexpected, result);
+}
+
+test "DeclareFinal: decode with extensions (Z=1)" {
+    // Header: 0x9A = sub-MID(0x1A) | Z(0x80)
+    // Extension: Unit ext header=0x01 (ENC=Unit, ID=0x01, Z=0), no body
+    const wire = [_]u8{ 0x9A, 0x01 };
+
+    var reader: Io.Reader = .fixed(&wire);
+    const header = try reader.takeByte();
+    const decoded = try DeclareFinal.decode(header, &reader);
+    _ = decoded;
+
+    // Reaching here without error means extensions were skipped correctly
+}
+
+// ---------------------------------------------------------------------------
+// Combined Declare + DeclareFinal tests
+// ---------------------------------------------------------------------------
+
+test "Declare + DeclareFinal: combined encoding for interest response" {
+    // Simulate: Declare(I=1, interest_id=1) + DeclareFinal
+    var buf: [16]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+
+    const declare = Declare{ .interest_id = 1 };
+    try declare.encodeHeader(&writer);
+
+    const declare_final = DeclareFinal{};
+    try declare_final.encode(&writer);
+
+    const encoded = writer.buffered();
+
+    // Expected: 0x3E (Declare header, I=1) + 0x01 (interest_id=1) + 0x1A (DeclareFinal)
+    try assertEqualBytes(&.{ 0x3E, 0x01, 0x1A }, encoded);
+}
+
+test "Declare + DeclareFinal: combined round-trip" {
+    // Encode
+    var buf: [16]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+
+    const original_declare = Declare{ .interest_id = 5 };
+    try original_declare.encodeHeader(&writer);
+
+    const original_final = DeclareFinal{};
+    try original_final.encode(&writer);
+
+    const encoded = writer.buffered();
+
+    // Decode
+    var reader: Io.Reader = .fixed(encoded);
+    const declare_header = try reader.takeByte();
+    try testing.expectEqual(@as(u5, MID.declare), hdr.Header.decode(declare_header).mid);
+    const decoded_declare = try Declare.decodeHeader(declare_header, &reader);
+    try testing.expectEqual(@as(u64, 5), decoded_declare.interest_id.?);
+
+    const sub_header = try reader.takeByte();
+    const decoded_final = try DeclareFinal.decode(sub_header, &reader);
+    _ = decoded_final;
+}
+
+test "Declare + DeclareFinal: wire vector for interest_id=0" {
+    var buf: [16]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+
+    const declare = Declare{ .interest_id = 0 };
+    try declare.encodeHeader(&writer);
+
+    const declare_final = DeclareFinal{};
+    try declare_final.encode(&writer);
+
+    const encoded = writer.buffered();
+
+    // Expected: 0x3E (Declare header, I=1) + 0x00 (interest_id=0) + 0x1A (DeclareFinal)
+    try assertEqualBytes(&.{ 0x3E, 0x00, 0x1A }, encoded);
+}
+
+test "Declare + DeclareFinal: wire vector for large interest_id" {
+    var buf: [16]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+
+    const declare = Declare{ .interest_id = 200 };
+    try declare.encodeHeader(&writer);
+
+    const declare_final = DeclareFinal{};
+    try declare_final.encode(&writer);
+
+    const encoded = writer.buffered();
+
+    // Expected: 0x3E + VLE(200)=0xC8,0x01 + 0x1A
+    try assertEqualBytes(&.{ 0x3E, 0xC8, 0x01, 0x1A }, encoded);
 }
 
 test {
