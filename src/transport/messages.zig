@@ -60,12 +60,33 @@ pub const WhatAmI = enum(u2) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Bit-width resolution encoding for SN, request ID, key expression ID.
-/// 0b00=8-bit, 0b01=16-bit, 0b10=32-bit, 0b11=64-bit.
+/// Each value specifies the number of VLE bytes used for the field:
+///   0b00 = 1 byte  → 7 data bits  → SN range [0, 2^7)
+///   0b01 = 2 bytes → 14 data bits → SN range [0, 2^14)
+///   0b10 = 4 bytes → 28 data bits → SN range [0, 2^28]
+///   0b11 = 8 bytes → 56 data bits → SN range [0, 2^56]
 pub const ResolutionBits = enum(u2) {
     bits_8 = 0b00,
     bits_16 = 0b01,
     bits_32 = 0b10,
     bits_64 = 0b11,
+
+    /// Return the number of VLE data bytes for this resolution.
+    /// bits_8→1, bits_16→2, bits_32→4, bits_64→8.
+    pub fn vleBytes(self: ResolutionBits) u4 {
+        return @as(u4, 1) << @intFromEnum(self);
+    }
+
+    /// Return the SN mask for this resolution.
+    ///
+    /// The Zenoh protocol defines SN resolution in terms of VLE byte
+    /// capacity: each VLE byte carries 7 data bits, so N VLE bytes
+    /// give 7×N data bits.  The mask is 2^(7×N) − 1, which keeps
+    /// generated sequence numbers within the valid range.
+    pub fn snMask(self: ResolutionBits) u64 {
+        const shift: u6 = @as(u6, 7) * self.vleBytes();
+        return (@as(u64, 1) << shift) - 1;
+    }
 };
 
 /// Resolution byte: encodes frame SN, request ID, and key expression ID resolutions.
@@ -739,6 +760,54 @@ test "Resolution: 0xFF byte → 64-bit for everything" {
 test "Resolution: non-default is detected" {
     const res = Resolution{ .frame_sn = .bits_16 };
     try testing.expect(!res.isDefault());
+}
+
+// ---------------------------------------------------------------------------
+// ResolutionBits VLE-based SN mask tests
+// ---------------------------------------------------------------------------
+
+test "ResolutionBits: vleBytes values" {
+    try testing.expectEqual(@as(u4, 1), ResolutionBits.bits_8.vleBytes());
+    try testing.expectEqual(@as(u4, 2), ResolutionBits.bits_16.vleBytes());
+    try testing.expectEqual(@as(u4, 4), ResolutionBits.bits_32.vleBytes());
+    try testing.expectEqual(@as(u4, 8), ResolutionBits.bits_64.vleBytes());
+}
+
+test "ResolutionBits: snMask for bits_8 is 2^7 - 1" {
+    // 1 VLE byte → 7 data bits → mask = 0x7F
+    try testing.expectEqual(@as(u64, 0x7F), ResolutionBits.bits_8.snMask());
+}
+
+test "ResolutionBits: snMask for bits_16 is 2^14 - 1" {
+    // 2 VLE bytes → 14 data bits → mask = 0x3FFF
+    try testing.expectEqual(@as(u64, 0x3FFF), ResolutionBits.bits_16.snMask());
+}
+
+test "ResolutionBits: snMask for bits_32 is 2^28 - 1" {
+    // 4 VLE bytes → 28 data bits → mask = 0x0FFFFFFF
+    try testing.expectEqual(@as(u64, 0x0FFFFFFF), ResolutionBits.bits_32.snMask());
+}
+
+test "ResolutionBits: snMask for bits_64 is 2^56 - 1" {
+    // 8 VLE bytes → 56 data bits → mask = 0x00FFFFFFFFFFFFFF
+    try testing.expectEqual(@as(u64, 0x00FFFFFFFFFFFFFF), ResolutionBits.bits_64.snMask());
+}
+
+test "ResolutionBits: masked SN fits within VLE capacity" {
+    // Verify that any random u64 masked with snMask fits within the resolution
+    const masks = [_]struct { bits: ResolutionBits, max_vle_bytes: usize }{
+        .{ .bits = .bits_8, .max_vle_bytes = 1 },
+        .{ .bits = .bits_16, .max_vle_bytes = 2 },
+        .{ .bits = .bits_32, .max_vle_bytes = 4 },
+        .{ .bits = .bits_64, .max_vle_bytes = 8 },
+    };
+    for (masks) |m| {
+        const mask = m.bits.snMask();
+        // Max masked value should encode in at most max_vle_bytes VLE bytes
+        try testing.expect(vle.encodedSize(mask) <= m.max_vle_bytes);
+        // One above the mask should need more bytes
+        try testing.expect(vle.encodedSize(mask + 1) > m.max_vle_bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------

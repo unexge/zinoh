@@ -297,12 +297,7 @@ pub const Session = struct {
         // Generate a random initial SN bounded by the negotiated frame SN resolution.
         var sn_bytes: [8]u8 = undefined;
         self.io.random(&sn_bytes);
-        const sn_mask: u64 = switch (self.resolution.frame_sn) {
-            .bits_8 => 0xFF,
-            .bits_16 => 0xFFFF,
-            .bits_32 => 0xFFFFFFFF,
-            .bits_64 => std.math.maxInt(u64),
-        };
+        const sn_mask = self.resolution.frame_sn.snMask();
         self.tx_sn = std.mem.readInt(u64, &sn_bytes, .little) & sn_mask;
 
         const open_syn = OpenSyn{
@@ -686,12 +681,7 @@ pub const Session = struct {
     /// wrapping according to the negotiated frame SN resolution.
     fn nextSn(self: *Session) u64 {
         const sn = self.tx_sn;
-        const sn_mask: u64 = switch (self.resolution.frame_sn) {
-            .bits_8 => 0xFF,
-            .bits_16 => 0xFFFF,
-            .bits_32 => 0xFFFFFFFF,
-            .bits_64 => std.math.maxInt(u64),
-        };
+        const sn_mask = self.resolution.frame_sn.snMask();
         self.tx_sn = (self.tx_sn +% 1) & sn_mask;
         return sn;
     }
