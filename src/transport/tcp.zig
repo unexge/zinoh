@@ -142,7 +142,7 @@ test "loopback: connect, send, recv, close" {
 
     // Start a TCP server on an ephemeral port
     const server_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
-    var server = net.IpAddress.listen(server_addr, io, .{ .reuse_address = true }) catch |err| {
+    var server = net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true }) catch |err| {
         std.log.warn("loopback test skipped: cannot listen ({any})", .{err});
         return;
     };
@@ -188,7 +188,7 @@ test "loopback: recvAlloc works correctly" {
     const allocator = testing.allocator;
 
     const server_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
-    var server = net.IpAddress.listen(server_addr, io, .{ .reuse_address = true }) catch |err| {
+    var server = net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true }) catch |err| {
         std.log.warn("loopback test skipped: cannot listen ({any})", .{err});
         return;
     };
@@ -220,7 +220,7 @@ test "loopback: multiple messages in sequence" {
     const allocator = testing.allocator;
 
     const server_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
-    var server = net.IpAddress.listen(server_addr, io, .{ .reuse_address = true }) catch |err| {
+    var server = net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true }) catch |err| {
         std.log.warn("loopback test skipped: cannot listen ({any})", .{err});
         return;
     };
@@ -259,7 +259,7 @@ test "loopback: empty message" {
     const allocator = testing.allocator;
 
     const server_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
-    var server = net.IpAddress.listen(server_addr, io, .{ .reuse_address = true }) catch |err| {
+    var server = net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true }) catch |err| {
         std.log.warn("loopback test skipped: cannot listen ({any})", .{err});
         return;
     };
@@ -289,7 +289,7 @@ test "loopback: clean close releases resources" {
     const allocator = testing.allocator;
 
     const server_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
-    var server = net.IpAddress.listen(server_addr, io, .{ .reuse_address = true }) catch |err| {
+    var server = net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true }) catch |err| {
         std.log.warn("loopback test skipped: cannot listen ({any})", .{err});
         return;
     };
