@@ -1,11 +1,11 @@
 //! Integration test entry point.
 //!
-//! Manages the zenohd Docker container lifecycle and runs smoke tests
-//! against a real Zenoh router.
+//! Runs smoke tests against a real Zenoh router.
 //!
-//! The container is started once on the first test that needs it and
-//! torn down after the last test finishes, using a reference-counting
-//! pattern in helpers.acquireZenohd / releaseZenohd.
+//! The zenohd Docker container is started once on the first test that
+//! needs it and kept running for the entire suite.  If the container
+//! is already reachable (e.g. started manually), Docker management is
+//! skipped.  See helpers.zig for lifecycle details.
 const std = @import("std");
 const net = std.Io.net;
 const zinoh = @import("zinoh");
@@ -23,7 +23,6 @@ test "smoke: TCP connectivity to zenohd" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
     const stream = try address.connect(io, .{ .mode = .stream });
@@ -35,7 +34,6 @@ test "session: connect and graceful close" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     // Create a client ZenohId
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0x01, 0x02, 0x03, 0x04 });
@@ -75,7 +73,6 @@ test "session: connect and close with different reason codes" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
 
@@ -103,7 +100,6 @@ test "session: deinit without close (error cleanup path)" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xAA, 0xBB, 0xCC, 0xDD });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -128,7 +124,6 @@ test "session: no resource leaks (allocator check)" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
 
@@ -148,7 +143,6 @@ test "session: connect with SessionConfig" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
 
@@ -188,7 +182,6 @@ test "session: negotiated fields are populated correctly after handshake" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
 
@@ -235,7 +228,6 @@ test "keepalive: session stays alive during idle period" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xCA, 0xFE, 0x01 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -266,7 +258,6 @@ test "keepalive: start and stop are idempotent" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xCA, 0xFE, 0x02 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -290,7 +281,6 @@ test "keepalive: close stops keepalive automatically" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xCA, 0xFE, 0x03 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -316,7 +306,6 @@ test "keepalive: leaseMillis returns plausible value for negotiated lease" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xCA, 0xFE, 0x04 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -346,7 +335,6 @@ test "tcp transport: connect, send InitSyn, recv InitAck, close" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const TcpTransport = zinoh.transport.tcp.TcpTransport;
     const transport_msgs = zinoh.transport.messages;
@@ -393,7 +381,6 @@ test "tcp transport: send and recv raw bytes" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const TcpTransport = zinoh.transport.tcp.TcpTransport;
     const transport_msgs = zinoh.transport.messages;
@@ -429,7 +416,6 @@ test "tcp transport: clean close (no leaked fds)" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const TcpTransport = zinoh.transport.tcp.TcpTransport;
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -450,7 +436,6 @@ test "z_put: publish to zenohd succeeds without error" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xA0, 0xA1, 0xA2 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -473,7 +458,6 @@ test "z_put: multiple puts with incrementing sequence numbers" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xB0, 0xB1, 0xB2 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -506,7 +490,6 @@ test "z_put: with encoding option" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xC0, 0xC1, 0xC2 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -531,7 +514,6 @@ test "z_get: query with no stored data returns empty result" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xD0, 0xD1, 0xD2 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -562,7 +544,6 @@ test "z_get: put then get round-trip" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
 
@@ -611,7 +592,6 @@ test "z_get: request_id is properly incremented" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const zid = try zinoh.transport.messages.ZenohId.init(&.{ 0xA1, 0xB1, 0xC1 });
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
@@ -651,7 +631,6 @@ test "z_put: multiple puts to different keys" {
     const io = std.testing.io;
 
     if (!try acquireOrSkip(allocator, io)) return;
-    defer helpers.releaseZenohd(allocator, io);
 
     const address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(helpers.zenoh_port) };
 

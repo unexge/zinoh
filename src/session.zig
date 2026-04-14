@@ -384,37 +384,50 @@ pub const Session = struct {
             // Decode Frame header (consume SN).
             _ = Frame.decodeHeader(transport_hdr_byte, &reader) catch continue;
 
-            // Parse the network message header.
-            const net_hdr_byte = reader.takeByte() catch continue;
-            const net_mid = hdr.Header.decode(net_hdr_byte).mid;
+            // Parse all network messages in this frame.  A single
+            // transport Frame can carry multiple network messages.
+            var exchange_complete = false;
+            while (true) {
+                const net_hdr_byte = reader.takeByte() catch break; // no more messages in this frame
+                const net_mid = hdr.Header.decode(net_hdr_byte).mid;
 
-            if (net_mid == network.MID.interest) {
-                // Decode Interest to extract the id.
-                const interest = try Interest.decode(net_hdr_byte, &reader, self.allocator);
-                defer interest.deinit(self.allocator);
+                if (net_mid == network.MID.interest) {
+                    // Decode Interest to extract the id.
+                    const interest = try Interest.decode(net_hdr_byte, &reader, self.allocator);
+                    defer interest.deinit(self.allocator);
 
-                // Respond with Frame → Declare(I=1, interest_id) → DeclareFinal.
-                try self.sendDeclareResponse(interest.id);
-                interest_responded = true;
-                continue;
-            }
-
-            if (net_mid == network.MID.declare) {
-                // Parse Declare header (consume interest_id if present).
-                _ = Declare.decodeHeader(net_hdr_byte, &reader) catch continue;
-
-                // Parse the inner declaration sub-message.
-                const decl_hdr_byte = reader.takeByte() catch continue;
-                const decl_mid = hdr.Header.decode(decl_hdr_byte).mid;
-
-                if (decl_mid == network.DeclareMID.declare_final) {
-                    // Router's DeclareFinal — exchange is complete
-                    // (only if we've already responded to the Interest).
-                    if (interest_responded) break;
+                    // Respond with Frame → Declare(I=1, interest_id) → DeclareFinal.
+                    try self.sendDeclareResponse(interest.id);
+                    interest_responded = true;
+                    continue;
                 }
-                // Other declarations (DeclareSubscriber, etc.) — skip.
-                continue;
+
+                if (net_mid == network.MID.declare) {
+                    // Parse Declare header (consume interest_id if present).
+                    _ = Declare.decodeHeader(net_hdr_byte, &reader) catch break;
+
+                    // Parse the inner declaration sub-message.
+                    const decl_hdr_byte = reader.takeByte() catch break;
+                    const decl_mid = hdr.Header.decode(decl_hdr_byte).mid;
+
+                    if (decl_mid == network.DeclareMID.declare_final) {
+                        // Router's DeclareFinal — exchange is complete
+                        // (only if we've already responded to the Interest).
+                        if (interest_responded) {
+                            exchange_complete = true;
+                            break;
+                        }
+                    }
+                    // Other declarations (DeclareSubscriber, etc.) — skip.
+                    continue;
+                }
+
+                // Unknown network message — can't determine size, stop
+                // parsing this frame and read the next one.
+                break;
             }
+
+            if (exchange_complete) break;
 
             // Other network messages — skip. If we haven't seen Interest
             // yet and we're getting unexpected messages, don't loop forever.
@@ -845,74 +858,86 @@ pub const Session = struct {
 
             _ = Frame.decodeHeader(frame_hdr_byte, &reader) catch continue;
 
-            // Parse the network message header.
-            const net_hdr_byte = reader.takeByte() catch continue;
-            const net_mid = hdr.Header.decode(net_hdr_byte).mid;
+            // Parse all network messages in this frame.  A single
+            // transport Frame can carry multiple network messages
+            // (e.g. Response + ResponseFinal back-to-back).
+            var response_complete = false;
+            while (true) {
+                const net_hdr_byte = reader.takeByte() catch break; // no more messages in this frame
+                const net_mid = hdr.Header.decode(net_hdr_byte).mid;
 
-            if (net_mid == network.MID.response_final) {
-                // ResponseFinal — end of replies.
-                const resp_final = ResponseFinal.decode(net_hdr_byte, &reader) catch continue;
-                if (resp_final.request_id == request_id) break;
-                // Not for our request — keep reading.
-                continue;
-            }
+                if (net_mid == network.MID.response_final) {
+                    // ResponseFinal — end of replies.
+                    const resp_final = ResponseFinal.decode(net_hdr_byte, &reader) catch break;
+                    if (resp_final.request_id == request_id) {
+                        response_complete = true;
+                        break;
+                    }
+                    // Not for our request — keep parsing this frame.
+                    continue;
+                }
 
-            if (net_mid == network.MID.response) {
-                // Response — contains a Reply(Put) or Reply(Del) or Err.
-                const resp = Response.decodeHeader(net_hdr_byte, &reader, self.allocator) catch continue;
-                defer resp.deinit(self.allocator);
+                if (net_mid == network.MID.response) {
+                    // Response — contains a Reply(Put) or Reply(Del) or Err.
+                    const resp = Response.decodeHeader(net_hdr_byte, &reader, self.allocator) catch break;
+                    defer resp.deinit(self.allocator);
 
-                if (resp.request_id != request_id) continue;
+                    if (resp.request_id != request_id) continue;
 
-                // Parse the inner Zenoh message (Reply or Err).
-                const zenoh_hdr_byte = reader.takeByte() catch continue;
-                const zenoh_mid = hdr.Header.decode(zenoh_hdr_byte).mid;
+                    // Parse the inner Zenoh message (Reply or Err).
+                    const zenoh_hdr_byte = reader.takeByte() catch break;
+                    const zenoh_mid = hdr.Header.decode(zenoh_hdr_byte).mid;
 
-                if (zenoh_mid == zenoh_msgs.MID.reply) {
-                    const reply = ZReply.decode(zenoh_hdr_byte, &reader, self.allocator) catch continue;
+                    if (zenoh_mid == zenoh_msgs.MID.reply) {
+                        const reply = ZReply.decode(zenoh_hdr_byte, &reader, self.allocator) catch break;
 
-                    switch (reply.body) {
-                        .put => |p| {
-                            // Copy key suffix if present.
-                            var reply_key: ?[]u8 = null;
-                            if (resp.key_suffix) |ks| {
-                                reply_key = self.allocator.dupe(u8, ks) catch {
-                                    reply.deinit(self.allocator);
+                        switch (reply.body) {
+                            .put => |p| {
+                                // Copy key suffix if present.
+                                var reply_key: ?[]u8 = null;
+                                if (resp.key_suffix) |ks| {
+                                    reply_key = self.allocator.dupe(u8, ks) catch {
+                                        reply.deinit(self.allocator);
+                                        return error.OutOfMemory;
+                                    };
+                                }
+
+                                // Transfer ownership of payload from the decoded Put.
+                                const get_reply = GetReply{
+                                    .key = reply_key,
+                                    .payload = self.allocator.dupe(u8, p.payload) catch {
+                                        if (reply_key) |k| self.allocator.free(k);
+                                        reply.deinit(self.allocator);
+                                        return error.OutOfMemory;
+                                    },
+                                    .encoding_id = if (p.encoding) |enc| enc.id else 0,
+                                };
+                                // Free the decoded reply (we've copied what we need).
+                                reply.deinit(self.allocator);
+
+                                replies.append(self.allocator, get_reply) catch {
+                                    get_reply.deinit(self.allocator);
                                     return error.OutOfMemory;
                                 };
-                            }
-
-                            // Transfer ownership of payload from the decoded Put.
-                            const get_reply = GetReply{
-                                .key = reply_key,
-                                .payload = self.allocator.dupe(u8, p.payload) catch {
-                                    if (reply_key) |k| self.allocator.free(k);
-                                    reply.deinit(self.allocator);
-                                    return error.OutOfMemory;
-                                },
-                                .encoding_id = if (p.encoding) |enc| enc.id else 0,
-                            };
-                            // Free the decoded reply (we've copied what we need).
-                            reply.deinit(self.allocator);
-
-                            replies.append(self.allocator, get_reply) catch {
-                                get_reply.deinit(self.allocator);
-                                return error.OutOfMemory;
-                            };
-                        },
-                        .del => {
-                            reply.deinit(self.allocator);
-                        },
+                            },
+                            .del => {
+                                reply.deinit(self.allocator);
+                            },
+                        }
+                    } else if (zenoh_mid == zenoh_msgs.MID.err) {
+                        // Err reply — skip for now (could be stored in result).
+                        const err_msg = ZErr.decode(zenoh_hdr_byte, &reader, self.allocator) catch break;
+                        err_msg.deinit(self.allocator);
                     }
-                } else if (zenoh_mid == zenoh_msgs.MID.err) {
-                    // Err reply — skip for now (could be stored in result).
-                    const err_msg = ZErr.decode(zenoh_hdr_byte, &reader, self.allocator) catch continue;
-                    err_msg.deinit(self.allocator);
+                    continue;
                 }
-                continue;
+
+                // Unknown network message — can't determine size, stop
+                // parsing this frame and read the next one.
+                break;
             }
 
-            // Unknown network message — skip.
+            if (response_complete) break;
         }
 
         return GetResult{
